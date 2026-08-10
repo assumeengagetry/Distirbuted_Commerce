@@ -1,0 +1,29 @@
+[Unit]
+Description=Distributed Commerce Redis
+
+[Container]
+Image=public.ecr.aws/docker/library/redis:7.4-alpine
+ContainerName=commerce-redis
+Network=pasta
+Volume=commerce-redis.volume:/data
+PublishPort=127.0.0.1:6379:6379
+Secret=commerce-redis-config
+Secret=commerce-redis-password,type=env,target=REDISCLI_AUTH
+Exec=redis-server /run/secrets/commerce-redis-config
+HealthCmd=redis-cli --user commerce ping 2>/dev/null | grep -qx PONG
+HealthInterval=5s
+HealthRetries=10
+HealthStartPeriod=5s
+HealthTimeout=3s
+HealthOnFailure=kill
+Notify=healthy
+AutoUpdate=registry
+Memory=256m
+PidsLimit=128
+StopTimeout=20
+
+[Service]
+Restart=on-failure
+RestartSec=2
+TimeoutStartSec=120
+TimeoutStopSec=30

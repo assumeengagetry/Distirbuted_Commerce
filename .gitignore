@@ -1,0 +1,13 @@
+.env
+.env.*
+!.env.example
+/.secrets/
+
+/bin/
+/coverage/
+coverage.out
+*.test
+
+.idea/
+.vscode/
+.DS_Store

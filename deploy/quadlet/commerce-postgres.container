@@ -1,0 +1,30 @@
+[Unit]
+Description=Distributed Commerce PostgreSQL
+
+[Container]
+Image=public.ecr.aws/docker/library/postgres:17-alpine
+ContainerName=commerce-postgres
+Network=pasta
+Volume=commerce-postgres.volume:/var/lib/postgresql/data
+PublishPort=127.0.0.1:5432:5432
+Environment=POSTGRES_DB=commerce
+Environment=POSTGRES_USER=commerce
+Environment=POSTGRES_PASSWORD_FILE=/run/secrets/commerce-postgres-password
+Secret=commerce-postgres-password
+HealthCmd=pg_isready -U commerce -d commerce
+HealthInterval=5s
+HealthRetries=10
+HealthStartPeriod=10s
+HealthTimeout=3s
+HealthOnFailure=kill
+Notify=healthy
+AutoUpdate=registry
+Memory=512m
+PidsLimit=256
+StopTimeout=20
+
+[Service]
+Restart=on-failure
+RestartSec=2
+TimeoutStartSec=120
+TimeoutStopSec=30

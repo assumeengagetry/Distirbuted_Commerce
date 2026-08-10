@@ -1,0 +1,6 @@
+[Unit]
+Description=Distributed Commerce Redis data
+
+[Volume]
+VolumeName=commerce-redis-data
+Label=io.assumeengagetry.distributed-commerce.component=redis

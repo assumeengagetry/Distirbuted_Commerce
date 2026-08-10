@@ -1,0 +1,6 @@
+[Unit]
+Description=Distributed Commerce PostgreSQL data
+
+[Volume]
+VolumeName=commerce-postgres-data
+Label=io.assumeengagetry.distributed-commerce.component=postgres
