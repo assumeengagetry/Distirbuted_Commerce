@@ -6,9 +6,25 @@ PODMAN ?= podman
 SYSTEMCTL ?= systemctl --user
 USER_BINARY := bin/user-service
 ORDER_BINARY := bin/order-service
+PAYMENT_BINARY := bin/payment-service
 MIGRATE_VERSION := v4.18.3
 MIGRATE_BIN := $(CURDIR)/bin/migrate-$(MIGRATE_VERSION)
 MIGRATE_PACKAGE := github.com/golang-migrate/migrate/v4/cmd/migrate@$(MIGRATE_VERSION)
+BUF_VERSION := v1.72.0
+BUF_BIN := $(CURDIR)/bin/buf-$(BUF_VERSION)
+BUF_PACKAGE := github.com/bufbuild/buf/cmd/buf@$(BUF_VERSION)
+PROTOC_GEN_GO_VERSION := v1.36.11
+PROTOC_GEN_GO_BIN := $(CURDIR)/bin/protoc-gen-go-$(PROTOC_GEN_GO_VERSION)
+PROTOC_GEN_GO_PACKAGE := google.golang.org/protobuf/cmd/protoc-gen-go@$(PROTOC_GEN_GO_VERSION)
+PROTOC_GEN_GO_GRPC_VERSION := v1.6.0
+PROTOC_GEN_GO_GRPC_BIN := $(CURDIR)/bin/protoc-gen-go-grpc-$(PROTOC_GEN_GO_GRPC_VERSION)
+PROTOC_GEN_GO_GRPC_PACKAGE := google.golang.org/grpc/cmd/protoc-gen-go-grpc@$(PROTOC_GEN_GO_GRPC_VERSION)
+SQLC_VERSION := v1.31.1
+SQLC_BIN := $(CURDIR)/bin/sqlc-$(SQLC_VERSION)
+SQLC_PACKAGE := github.com/sqlc-dev/sqlc/cmd/sqlc@$(SQLC_VERSION)
+GOVULNCHECK_VERSION := v1.6.0
+GOVULNCHECK_BIN := $(CURDIR)/bin/govulncheck-$(GOVULNCHECK_VERSION)
+GOVULNCHECK_PACKAGE := golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION)
 SECRETS_DIR := $(CURDIR)/.secrets
 QUADLET_FILES := \
 	deploy/quadlet/commerce-postgres.volume \
@@ -16,24 +32,30 @@ QUADLET_FILES := \
 	deploy/quadlet/commerce-postgres.container \
 	deploy/quadlet/commerce-redis.container
 
-.PHONY: help init build run run-user run-order fmt fmt-check vet test test-race test-integration check migrate-install \
+.PHONY: help init build run run-user run-order run-payment fmt fmt-check vet test test-race test-integration check release-check migrate-install \
 	sqlc sqlc-vet secrets quadlet-check quadlet-install infra-up infra-down infra-status infra-logs \
-	migrate-up migrate-down migrate-version migrate-create require-env require-secrets
+	migrate-up migrate-down migrate-version migrate-create require-env require-database-secret require-user-secrets require-infra-secrets \
+	proto-tools proto-format proto-lint proto-generate proto-check mod-check vulncheck test-database
 
 help:
 	@printf '%s\n' \
 		'init              Create .env and random local secret files' \
-		'build             Build user-service and order-service binaries' \
+		'build             Build user, order, and payment service binaries' \
 		'run               Run user-service with values from .env' \
 		'run-order         Run order-service on 127.0.0.1:8082' \
+		'run-payment       Run payment-service on 127.0.0.1:8083' \
 		'fmt               Format every Go source file' \
 		'fmt-check         Fail when any Go source file is unformatted' \
 		'vet               Run go vet' \
 		'test              Run unit and HTTP tests' \
 		'test-race         Run tests with the race detector' \
-		'test-integration  Run PostgreSQL integration tests' \
+		'test-integration  Recreate the isolated database and run integration tests' \
+		'test-database     Create the isolated local test database when absent' \
 		'check             Run static checks, tests, race tests, and build' \
+		'release-check     Add integration, vulnerability, module, and generation gates' \
 		'sqlc              Generate typed database code' \
+		'proto-generate     Generate Go protobuf and gRPC code' \
+		'proto-lint         Lint protobuf contracts with pinned Buf' \
 		'migrate-install   Build the pinned golang-migrate CLI' \
 		'infra-up          Recreate and start rootless Podman Quadlets' \
 		'infra-down        Stop development infrastructure' \
@@ -50,22 +72,34 @@ build:
 	@mkdir -p bin
 	$(GO) build -trimpath -o $(USER_BINARY) ./cmd/user-service
 	$(GO) build -trimpath -o $(ORDER_BINARY) ./cmd/order-service
+	$(GO) build -trimpath -o $(PAYMENT_BINARY) ./cmd/payment-service
 
 run: run-user
 
-run-user: require-env require-secrets
+run-user: require-env require-user-secrets
 	@set -a; source ./.env; set +a; \
 	export PGPASSFILE='$(SECRETS_DIR)/pgpass'; \
 	export PASETO_V4_LOCAL_KEY="$$(<'$(SECRETS_DIR)/paseto_v4_local_key')"; \
+	export GRPC_ADDR="$${GRPC_ADDR:-127.0.0.1:9091}"; \
 	exec $(GO) run ./cmd/user-service
 
-run-order: require-env require-secrets
+run-order: require-env require-database-secret
 	@set -a; source ./.env; set +a; \
 	export SERVICE_NAME='order-service'; \
 	export HTTP_ADDR="$${ORDER_HTTP_ADDR:-127.0.0.1:8082}"; \
 	export PGPASSFILE='$(SECRETS_DIR)/pgpass'; \
-	export PASETO_V4_LOCAL_KEY="$$(<'$(SECRETS_DIR)/paseto_v4_local_key')"; \
+	export IDENTITY_GRPC_TARGET="$${IDENTITY_GRPC_TARGET:-127.0.0.1:9091}"; \
+	unset PASETO_V4_LOCAL_KEY; \
 	exec $(GO) run ./cmd/order-service
+
+run-payment: require-env require-database-secret
+	@set -a; source ./.env; set +a; \
+	export SERVICE_NAME='payment-service'; \
+	export HTTP_ADDR="$${PAYMENT_HTTP_ADDR:-127.0.0.1:8083}"; \
+	export PGPASSFILE='$(SECRETS_DIR)/pgpass'; \
+	export IDENTITY_GRPC_TARGET="$${IDENTITY_GRPC_TARGET:-127.0.0.1:9091}"; \
+	unset PASETO_V4_LOCAL_KEY; \
+	exec $(GO) run ./cmd/payment-service
 
 fmt:
 	@files="$$(find . -type f -name '*.go' -not -path './vendor/*')"; gofmt -w $$files
@@ -84,18 +118,73 @@ test:
 test-race:
 	$(GO) test -race ./...
 
-test-integration: require-env require-secrets migrate-up
+test-integration: require-env require-database-secret $(MIGRATE_BIN)
 	@set -a; source ./.env; set +a; \
 	export PGPASSFILE='$(SECRETS_DIR)/pgpass'; \
-	TEST_DATABASE_URL="$$DATABASE_URL" $(GO) test -count=1 -tags=integration ./...
+	test -n "$${TEST_DATABASE_URL:-}" || { printf 'TEST_DATABASE_URL must point to an isolated test database.\n' >&2; exit 1; }; \
+	app_env="$${APP_ENV:-local}"; app_env="$${app_env,,}"; app_env="$${app_env#"$${app_env%%[![:space:]]*}"}"; app_env="$${app_env%"$${app_env##*[![:space:]]}"}"; \
+	test "$$app_env" != 'production' || { printf 'Integration tests must not run with APP_ENV=production.\n' >&2; exit 1; }; \
+	bash scripts/manage-test-database.sh reset "$$DATABASE_URL" "$$TEST_DATABASE_URL"; \
+	$(MIGRATE_BIN) -path=db/migrations -database "$$TEST_DATABASE_URL" up; \
+	$(MIGRATE_BIN) -path=db/migrations -database "$$TEST_DATABASE_URL" down -all; \
+	$(MIGRATE_BIN) -path=db/migrations -database "$$TEST_DATABASE_URL" up; \
+	TEST_DATABASE_URL="$$TEST_DATABASE_URL" $(GO) test -count=1 -p=1 -tags=integration ./...
 
-check: sqlc fmt-check vet test test-race build sqlc-vet quadlet-check
+check: proto-check fmt-check vet test test-race build sqlc-vet quadlet-check
 
-sqlc:
-	sqlc generate
+release-check: check test-integration vulncheck mod-check
 
-sqlc-vet:
-	sqlc vet
+sqlc: $(SQLC_BIN)
+	$(SQLC_BIN) generate
+
+sqlc-vet: $(SQLC_BIN)
+	$(SQLC_BIN) vet
+
+proto-tools: $(BUF_BIN) $(PROTOC_GEN_GO_BIN) $(PROTOC_GEN_GO_GRPC_BIN)
+
+proto-format: $(BUF_BIN)
+	$(BUF_BIN) format -w
+
+proto-lint: $(BUF_BIN)
+	$(BUF_BIN) lint
+
+proto-generate: proto-tools proto-lint
+	$(BUF_BIN) generate
+
+proto-check: proto-tools $(SQLC_BIN) proto-lint
+	$(BUF_BIN) breaking --against api/proto-baseline
+	bash scripts/check-generated.sh '$(BUF_BIN)' '$(SQLC_BIN)'
+
+mod-check:
+	$(GO) mod tidy -diff
+
+vulncheck: $(GOVULNCHECK_BIN)
+	$(GOVULNCHECK_BIN) ./...
+
+$(BUF_BIN):
+	@mkdir -p bin
+	GOBIN='$(CURDIR)/bin' $(GO) install '$(BUF_PACKAGE)'
+	mv '$(CURDIR)/bin/buf' '$(BUF_BIN)'
+
+$(PROTOC_GEN_GO_BIN):
+	@mkdir -p bin
+	GOBIN='$(CURDIR)/bin' $(GO) install '$(PROTOC_GEN_GO_PACKAGE)'
+	mv '$(CURDIR)/bin/protoc-gen-go' '$(PROTOC_GEN_GO_BIN)'
+
+$(PROTOC_GEN_GO_GRPC_BIN):
+	@mkdir -p bin
+	GOBIN='$(CURDIR)/bin' $(GO) install '$(PROTOC_GEN_GO_GRPC_PACKAGE)'
+	mv '$(CURDIR)/bin/protoc-gen-go-grpc' '$(PROTOC_GEN_GO_GRPC_BIN)'
+
+$(SQLC_BIN):
+	@mkdir -p bin
+	GOBIN='$(CURDIR)/bin' $(GO) install '$(SQLC_PACKAGE)'
+	mv '$(CURDIR)/bin/sqlc' '$(SQLC_BIN)'
+
+$(GOVULNCHECK_BIN):
+	@mkdir -p bin
+	GOBIN='$(CURDIR)/bin' $(GO) install '$(GOVULNCHECK_PACKAGE)'
+	mv '$(CURDIR)/bin/govulncheck' '$(GOVULNCHECK_BIN)'
 
 migrate-install: $(MIGRATE_BIN)
 
@@ -107,14 +196,18 @@ $(MIGRATE_BIN):
 require-env:
 	@test -f .env || { printf 'Run make init first.\n' >&2; exit 1; }
 
-require-secrets:
-	@test -s '$(SECRETS_DIR)/postgres_password' || { printf 'Run make init first.\n' >&2; exit 1; }
-	@test -s '$(SECRETS_DIR)/redis_password' || { printf 'Run make init first.\n' >&2; exit 1; }
+require-database-secret:
 	@test -s '$(SECRETS_DIR)/pgpass' || { printf 'Run make init first.\n' >&2; exit 1; }
-	@test -s '$(SECRETS_DIR)/redis.conf' || { printf 'Run make init first.\n' >&2; exit 1; }
+
+require-user-secrets: require-database-secret
 	@test -s '$(SECRETS_DIR)/paseto_v4_local_key' || { printf 'Run make init first.\n' >&2; exit 1; }
 
-secrets: require-secrets
+require-infra-secrets:
+	@test -s '$(SECRETS_DIR)/postgres_password' || { printf 'Run make init first.\n' >&2; exit 1; }
+	@test -s '$(SECRETS_DIR)/redis_password' || { printf 'Run make init first.\n' >&2; exit 1; }
+	@test -s '$(SECRETS_DIR)/redis.conf' || { printf 'Run make init first.\n' >&2; exit 1; }
+
+secrets: require-infra-secrets
 	@$(PODMAN) secret create --replace commerce-postgres-password '$(SECRETS_DIR)/postgres_password' >/dev/null
 	@$(PODMAN) secret create --replace commerce-redis-password '$(SECRETS_DIR)/redis_password' >/dev/null
 	@$(PODMAN) secret create --replace commerce-redis-config '$(SECRETS_DIR)/redis.conf' >/dev/null
@@ -127,10 +220,17 @@ quadlet-install: quadlet-check
 	$(PODMAN) quadlet install --replace $(QUADLET_FILES)
 	$(SYSTEMCTL) daemon-reload
 
-infra-up: require-secrets quadlet-install
+infra-up: require-infra-secrets quadlet-install
 	@$(SYSTEMCTL) stop commerce-postgres.service commerce-redis.service >/dev/null 2>&1 || true
 	@$(MAKE) --no-print-directory secrets
 	$(SYSTEMCTL) start commerce-postgres.service commerce-redis.service
+	@$(MAKE) --no-print-directory test-database
+
+test-database: require-env require-database-secret
+	@set -a; source ./.env; set +a; \
+	export PGPASSFILE='$(SECRETS_DIR)/pgpass'; \
+	test -n "$${TEST_DATABASE_URL:-}" || { printf 'TEST_DATABASE_URL is required.\n' >&2; exit 1; }; \
+	bash scripts/manage-test-database.sh ensure "$$DATABASE_URL" "$$TEST_DATABASE_URL"
 
 infra-down:
 	$(SYSTEMCTL) stop commerce-postgres.service commerce-redis.service
@@ -141,19 +241,19 @@ infra-status:
 infra-logs:
 	journalctl --user --follow -u commerce-postgres.service -u commerce-redis.service
 
-migrate-up: require-env require-secrets $(MIGRATE_BIN)
+migrate-up: require-env require-database-secret $(MIGRATE_BIN)
 	@set -a; source ./.env; set +a; \
 	test -n "$${DATABASE_URL:-}" || { printf 'DATABASE_URL is required.\n' >&2; exit 1; }; \
 	export PGPASSFILE='$(SECRETS_DIR)/pgpass'; \
 	$(MIGRATE_BIN) -path=db/migrations -database "$$DATABASE_URL" up
 
-migrate-down: require-env require-secrets $(MIGRATE_BIN)
+migrate-down: require-env require-database-secret $(MIGRATE_BIN)
 	@set -a; source ./.env; set +a; \
 	test -n "$${DATABASE_URL:-}" || { printf 'DATABASE_URL is required.\n' >&2; exit 1; }; \
 	export PGPASSFILE='$(SECRETS_DIR)/pgpass'; \
 	$(MIGRATE_BIN) -path=db/migrations -database "$$DATABASE_URL" down 1
 
-migrate-version: require-env require-secrets $(MIGRATE_BIN)
+migrate-version: require-env require-database-secret $(MIGRATE_BIN)
 	@set -a; source ./.env; set +a; \
 	test -n "$${DATABASE_URL:-}" || { printf 'DATABASE_URL is required.\n' >&2; exit 1; }; \
 	export PGPASSFILE='$(SECRETS_DIR)/pgpass'; \

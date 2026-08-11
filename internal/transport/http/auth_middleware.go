@@ -1,8 +1,9 @@
 package httptransport
 
 import (
+	"context"
+	"errors"
 	"net/http"
-	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -10,10 +11,10 @@ import (
 )
 
 type AccessTokenVerifier interface {
-	ParseAccess(encoded string, now time.Time) (auth.Principal, error)
+	VerifyAccess(context.Context, string) (auth.Principal, error)
 }
 
-func authenticate(verifier AccessTokenVerifier, now func() time.Time) gin.HandlerFunc {
+func authenticate(verifier AccessTokenVerifier) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Header("Cache-Control", "no-store")
 		headers := c.Request.Header.Values("Authorization")
@@ -28,10 +29,15 @@ func authenticate(verifier AccessTokenVerifier, now func() time.Time) gin.Handle
 			writeAPIError(c, http.StatusUnauthorized, "UNAUTHORIZED", "authentication required")
 			return
 		}
-		principal, err := verifier.ParseAccess(token, now().UTC())
+		principal, err := verifier.VerifyAccess(c.Request.Context(), token)
 		if err != nil {
-			c.Header("WWW-Authenticate", "Bearer")
-			writeAPIError(c, http.StatusUnauthorized, "UNAUTHORIZED", "authentication required")
+			if errors.Is(err, auth.ErrInvalidAccessToken) {
+				c.Header("WWW-Authenticate", "Bearer")
+				writeAPIError(c, http.StatusUnauthorized, "UNAUTHORIZED", "authentication required")
+				return
+			}
+			c.Header("Retry-After", "1")
+			writeAPIError(c, http.StatusServiceUnavailable, "IDENTITY_UNAVAILABLE", "identity service temporarily unavailable")
 			return
 		}
 

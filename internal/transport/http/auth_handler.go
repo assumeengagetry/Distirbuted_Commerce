@@ -79,6 +79,7 @@ type profileResponse struct {
 }
 
 func (h authHandler) register(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
 	var body registerBody
 	if err := decodeJSON(c, &body); err != nil {
 		writeDecodeError(c, err)
@@ -95,6 +96,7 @@ func (h authHandler) register(c *gin.Context) {
 }
 
 func (h authHandler) login(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
 	var body loginBody
 	if err := decodeJSON(c, &body); err != nil {
 		writeDecodeError(c, err)
@@ -109,6 +111,7 @@ func (h authHandler) login(c *gin.Context) {
 }
 
 func (h authHandler) refresh(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
 	var body refreshBody
 	if err := decodeJSON(c, &body); err != nil {
 		writeDecodeError(c, err)

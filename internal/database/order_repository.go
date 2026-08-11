@@ -1,10 +1,12 @@
 package database
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"math"
+	"sort"
 	"time"
 
 	"github.com/google/uuid"
@@ -13,19 +15,27 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	store "github.com/assumeengagetry/distributed-commerce/internal/database/sqlc"
+	"github.com/assumeengagetry/distributed-commerce/internal/idempotency"
 	commerce "github.com/assumeengagetry/distributed-commerce/internal/order"
 )
 
 type OrderRepository struct {
-	pool             *pgxpool.Pool
-	queries          *store.Queries
-	lockTimeout      time.Duration
-	statementTimeout time.Duration
+	pool                    *pgxpool.Pool
+	queries                 *store.Queries
+	lockTimeout             time.Duration
+	statementTimeout        time.Duration
+	commitResolutionTimeout time.Duration
+	commitTransaction       func(context.Context, pgx.Tx) error
 }
 
-func NewOrderRepository(pool *pgxpool.Pool, lockTimeout, statementTimeout time.Duration) *OrderRepository {
+func NewOrderRepository(
+	pool *pgxpool.Pool,
+	lockTimeout, statementTimeout, commitResolutionTimeout time.Duration,
+) *OrderRepository {
 	return &OrderRepository{
 		pool: pool, queries: store.New(pool), lockTimeout: lockTimeout, statementTimeout: statementTimeout,
+		commitResolutionTimeout: commitResolutionTimeout,
+		commitTransaction:       func(ctx context.Context, tx pgx.Tx) error { return tx.Commit(ctx) },
 	}
 }
 
@@ -319,6 +329,10 @@ func (r *OrderRepository) CreateOrder(
 	actorID uuid.UUID,
 	params commerce.CreateOrderParams,
 ) (commerce.Order, error) {
+	params.Items = append([]commerce.RequestedItem(nil), params.Items...)
+	sort.Slice(params.Items, func(i, j int) bool {
+		return bytes.Compare(params.Items[i].ProductID[:], params.Items[j].ProductID[:]) < 0
+	})
 	tx, queries, err := r.begin(ctx, "order creation")
 	if err != nil {
 		return commerce.Order{}, err
@@ -334,6 +348,24 @@ func (r *OrderRepository) CreateOrder(
 	}
 	if err := validateStoredActor(actor.Role, actor.Status, commerce.RoleCustomer); err != nil {
 		return commerce.Order{}, err
+	}
+	claim, err := claimIdempotency(
+		ctx, queries, actorID, idempotency.OrderCreateOperation,
+		params.KeyHash, params.RequestHash, params.OrderID,
+	)
+	if err != nil {
+		return commerce.Order{}, mapOrderIdempotencyError(err)
+	}
+	if claim.Replay {
+		replayed, err := loadCreatedOrder(ctx, queries, actorID, claim.ResourceID)
+		if err != nil {
+			return commerce.Order{}, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return commerce.Order{}, mapCommerceDatabaseError("commit order replay read", err)
+		}
+		replayed.IdempotencyReplay = true
+		return replayed, nil
 	}
 
 	items := make([]commerce.OrderItem, 0, len(params.Items))
@@ -404,12 +436,79 @@ func (r *OrderRepository) CreateOrder(
 			return commerce.Order{}, mapCommerceDatabaseError("create order item", err)
 		}
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return commerce.Order{}, mapCommerceDatabaseError("commit order creation", err)
+	if err := completeIdempotency(
+		ctx, queries, actorID, idempotency.OrderCreateOperation,
+		params.KeyHash, params.RequestHash, params.OrderID,
+	); err != nil {
+		return commerce.Order{}, mapCommerceDatabaseError("complete order idempotency", err)
+	}
+	if err := r.commitTransaction(ctx, tx); err != nil {
+		if commitOutcomeIsKnown(err) {
+			return commerce.Order{}, mapCommerceDatabaseError("commit order creation", err)
+		}
+		return r.resolveOrderCommit(ctx, actorID, params)
 	}
 	result := orderFromModel(dbOrder)
 	result.Items = items
 	return result, nil
+}
+
+func (r *OrderRepository) resolveOrderCommit(
+	ctx context.Context,
+	actorID uuid.UUID,
+	params commerce.CreateOrderParams,
+) (commerce.Order, error) {
+	resolutionCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), r.commitResolutionTimeout)
+	defer cancel()
+	resourceID, err := waitForCompletedIdempotency(
+		resolutionCtx, r.queries, actorID, idempotency.OrderCreateOperation,
+		params.KeyHash, params.RequestHash,
+	)
+	if err != nil {
+		return commerce.Order{}, mapOrderIdempotencyError(err)
+	}
+	result, err := loadCreatedOrder(resolutionCtx, r.queries, actorID, resourceID)
+	if err != nil {
+		return commerce.Order{}, err
+	}
+	result.IdempotencyReplay = true
+	return result, nil
+}
+
+func loadCreatedOrder(
+	ctx context.Context,
+	queries *store.Queries,
+	actorID, orderID uuid.UUID,
+) (commerce.Order, error) {
+	row, err := queries.GetOrderByIDAndUser(ctx, store.GetOrderByIDAndUserParams{ID: orderID, UserID: actorID})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return commerce.Order{}, fmt.Errorf("load idempotent order: resource not found")
+	}
+	if err != nil {
+		return commerce.Order{}, mapCommerceDatabaseError("load idempotent order", err)
+	}
+	items, err := queries.ListOrderItemsByOrderID(ctx, orderID)
+	if err != nil {
+		return commerce.Order{}, mapCommerceDatabaseError("load idempotent order items", err)
+	}
+	result := orderFromModel(row)
+	result.Status = commerce.OrderStatusPending
+	result.UpdatedAt = result.CreatedAt
+	result.Items = orderItemsFromModels(items)
+	return result, nil
+}
+
+func mapOrderIdempotencyError(err error) error {
+	switch {
+	case errors.Is(err, errIdempotencyConflict):
+		return commerce.ErrIdempotencyConflict
+	case errors.Is(err, errIdempotencyInProgress):
+		return commerce.ErrIdempotencyInProgress
+	case errors.Is(err, errIdempotencyOutcomeUnknown):
+		return commerce.ErrOperationOutcomeUnknown
+	default:
+		return mapCommerceDatabaseError("order idempotency", err)
+	}
 }
 
 func (r *OrderRepository) ListOrders(

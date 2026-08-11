@@ -43,6 +43,11 @@ type orderResponse struct {
 }
 
 func (h commerceHandler) createOrder(c *gin.Context) {
+	idempotencyKey, err := idempotencyKeyFromRequest(c)
+	if err != nil {
+		writeIdempotencyHeaderError(c, err)
+		return
+	}
 	var body createOrderBody
 	if err := decodeJSON(c, &body); err != nil {
 		writeDecodeError(c, err)
@@ -59,12 +64,17 @@ func (h commerceHandler) createOrder(c *gin.Context) {
 			ExpectedProductVersion: item.ExpectedProductVersion,
 		}
 	}
-	created, err := h.service.CreateOrder(c.Request.Context(), actor, commerce.CreateOrderRequest{Items: items})
+	created, err := h.service.CreateOrder(c.Request.Context(), actor, commerce.CreateOrderRequest{
+		Items: items, IdempotencyKey: idempotencyKey,
+	})
 	if err != nil {
 		h.writeServiceError(c, err)
 		return
 	}
 	c.Header("Location", "/v1/orders/"+created.ID.String())
+	if created.IdempotencyReplay {
+		c.Header("Idempotency-Replayed", "true")
+	}
 	c.JSON(http.StatusCreated, gin.H{"order": orderResult(created)})
 }
 

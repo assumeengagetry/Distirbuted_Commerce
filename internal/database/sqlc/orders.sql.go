@@ -320,7 +320,7 @@ SELECT id, order_id, product_id, product_sku, product_name, product_version,
        quantity, unit_price_amount, line_amount, created_at
 FROM order_items
 WHERE order_id = $1
-ORDER BY id
+ORDER BY product_id
 `
 
 func (q *Queries) ListOrderItemsByOrderID(ctx context.Context, orderID uuid.UUID) ([]OrderItem, error) {

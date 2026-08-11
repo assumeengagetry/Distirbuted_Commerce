@@ -9,9 +9,9 @@ import (
 )
 
 type healthHandler struct {
-	serviceName    string
-	readinessCheck func(context.Context) error
-	checkTimeout   time.Duration
+	serviceName     string
+	readinessChecks map[string]func(context.Context) error
+	checkTimeout    time.Duration
 }
 
 type healthResponse struct {
@@ -38,11 +38,41 @@ func (h healthHandler) readiness(c *gin.Context) {
 	defer cancel()
 
 	c.Header("Cache-Control", "no-store")
-	if err := h.readinessCheck(ctx); err != nil {
+	type checkResult struct {
+		name string
+		err  error
+	}
+	results := make(chan checkResult, len(h.readinessChecks))
+	pending := make(map[string]struct{}, len(h.readinessChecks))
+	for name, check := range h.readinessChecks {
+		pending[name] = struct{}{}
+		go func() { results <- checkResult{name: name, err: check(ctx)} }()
+	}
+	checks := make(map[string]string, len(h.readinessChecks))
+	ready := true
+	for len(pending) > 0 {
+		select {
+		case result := <-results:
+			delete(pending, result.name)
+			if result.err != nil {
+				checks[result.name] = "down"
+				ready = false
+				continue
+			}
+			checks[result.name] = "up"
+		case <-ctx.Done():
+			for name := range pending {
+				checks[name] = "down"
+				delete(pending, name)
+			}
+			ready = false
+		}
+	}
+	if !ready {
 		c.JSON(http.StatusServiceUnavailable, healthResponse{
 			Status:  "not_ready",
 			Service: h.serviceName,
-			Checks:  map[string]string{"postgres": "down"},
+			Checks:  checks,
 		})
 		return
 	}
@@ -50,6 +80,6 @@ func (h healthHandler) readiness(c *gin.Context) {
 	c.JSON(http.StatusOK, healthResponse{
 		Status:  "ready",
 		Service: h.serviceName,
-		Checks:  map[string]string{"postgres": "up"},
+		Checks:  checks,
 	})
 }

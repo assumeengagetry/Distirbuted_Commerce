@@ -1,21 +1,111 @@
 -- name: HealthCheck :one
-SELECT CASE
-    WHEN to_regclass('public.users') IS NOT NULL
-    AND to_regclass('public.accounts') IS NOT NULL
-    AND to_regclass('public.auth_sessions') IS NOT NULL
-    AND to_regclass('public.refresh_tokens') IS NOT NULL
-    THEN 1::integer
-    ELSE 0::integer
-END;
+WITH schema_probe AS MATERIALIZED (
+    SELECT
+        u.id, u.email, u.password_hash, u.display_name, u.role, u.status, u.created_at, u.updated_at,
+        a.id, a.user_id, a.currency, a.balance, a.balance_version, a.created_at, a.updated_at,
+        s.id, s.user_id, s.expires_at, s.revoked_at, s.created_at, s.updated_at,
+        r.id, r.session_id, r.token_hash, r.consumed_at, r.created_at
+    FROM users AS u
+    CROSS JOIN accounts AS a
+    CROSS JOIN auth_sessions AS s
+    CROSS JOIN refresh_tokens AS r
+    WHERE false
+)
+SELECT (count(*) * 0 + 1)::integer
+FROM schema_probe;
 
 -- name: OrderHealthCheck :one
+WITH schema_probe AS MATERIALIZED (
+    SELECT
+        u.id, u.role, u.status,
+        a.id, a.user_id, a.currency,
+        p.id, p.sku, p.name, p.description, p.price_amount, p.currency, p.status,
+        p.version, p.created_at, p.updated_at,
+        i.product_id, i.quantity, i.version, i.created_at, i.updated_at,
+        o.id, o.user_id, o.status, o.currency, o.total_amount, o.created_at, o.updated_at,
+        oi.id, oi.order_id, oi.product_id, oi.product_sku, oi.product_name, oi.product_version,
+        oi.unit_price_amount, oi.quantity, oi.line_amount, oi.created_at,
+        k.actor_id, k.operation, k.key_hash, k.request_hash, k.resource_id,
+        k.state, k.response_status, k.created_at, k.completed_at
+    FROM users AS u
+    CROSS JOIN accounts AS a
+    CROSS JOIN products AS p
+    CROSS JOIN inventories AS i
+    CROSS JOIN orders AS o
+    CROSS JOIN order_items AS oi
+    CROSS JOIN idempotency_keys AS k
+    WHERE false
+)
+SELECT (count(*) * 0 + 1)::integer
+FROM schema_probe;
+
+-- name: PaymentHealthCheck :one
+WITH schema_probe AS MATERIALIZED (
+    SELECT
+        u.id, u.role, u.status,
+        a.id, a.user_id, a.currency, a.balance, a.balance_version, a.created_at, a.updated_at,
+        o.id, o.user_id, o.status, o.currency, o.total_amount, o.created_at, o.updated_at,
+        p.id, p.order_id, p.user_id, p.account_id, p.account_balance_version,
+        p.status, p.currency, p.amount, p.balance_before, p.balance_after, p.created_at,
+        e.account_id, e.user_id, e.currency, e.balance_version,
+        e.balance_before, e.balance_after, e.debit_amount, e.created_at,
+        k.actor_id, k.operation, k.key_hash, k.request_hash, k.resource_id,
+        k.state, k.response_status, k.created_at, k.completed_at
+    FROM users AS u
+    CROSS JOIN accounts AS a
+    CROSS JOIN orders AS o
+    CROSS JOIN payments AS p
+    CROSS JOIN account_balance_entries AS e
+    CROSS JOIN idempotency_keys AS k
+    WHERE false
+)
 SELECT CASE
-    WHEN to_regclass('public.users') IS NOT NULL
-    AND to_regclass('public.accounts') IS NOT NULL
-    AND to_regclass('public.products') IS NOT NULL
-    AND to_regclass('public.inventories') IS NOT NULL
-    AND to_regclass('public.orders') IS NOT NULL
-    AND to_regclass('public.order_items') IS NOT NULL
+    WHEN to_regprocedure('public.enforce_payment_settlement()') IS NOT NULL
+    AND to_regprocedure('public.version_account_balance()') IS NOT NULL
+    AND to_regprocedure('public.record_account_balance_entry()') IS NOT NULL
+    AND to_regprocedure('public.enforce_payment_immutable()') IS NOT NULL
+    AND to_regprocedure('public.enforce_paid_order_terminal()') IS NOT NULL
+    AND (
+        SELECT count(*)
+        FROM pg_catalog.pg_constraint
+        WHERE conrelid = to_regclass('public.payments')
+          AND conname IN (
+              'payments_order_unique', 'payments_order_identity_fk',
+              'payments_account_identity_fk', 'payments_balance_entry_fk',
+              'payments_balance_entry_unique', 'payments_settlement_consistent'
+          )
+    ) = 6
+    AND (
+        SELECT count(*)
+        FROM pg_catalog.pg_trigger AS t
+        JOIN pg_catalog.pg_proc AS f ON f.oid = t.tgfoid
+        WHERE NOT t.tgisinternal
+          AND t.tgenabled IN ('O', 'A')
+          AND (
+              (
+                  t.tgrelid = to_regclass('public.accounts')
+                  AND t.tgname = 'accounts_version_balance'
+                  AND f.proname = 'version_account_balance'
+              ) OR (
+                  t.tgrelid = to_regclass('public.accounts')
+                  AND t.tgname = 'accounts_record_balance_entry'
+                  AND f.proname = 'record_account_balance_entry'
+              ) OR (
+                  t.tgrelid = to_regclass('public.payments')
+                  AND t.tgname = 'payments_settlement_consistent'
+                  AND f.proname = 'enforce_payment_settlement'
+              ) OR (
+                  t.tgrelid = to_regclass('public.payments')
+                  AND t.tgname = 'payments_immutable'
+                  AND f.proname = 'enforce_payment_immutable'
+              ) OR (
+                  t.tgrelid = to_regclass('public.orders')
+                  AND t.tgname = 'orders_paid_status_terminal'
+                  AND f.proname = 'enforce_paid_order_terminal'
+              )
+          )
+    ) = 5
     THEN 1::integer
     ELSE 0::integer
-END;
+END
+FROM (SELECT count(*) FROM schema_probe) AS probe;

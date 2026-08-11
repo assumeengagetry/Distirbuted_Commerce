@@ -158,7 +158,7 @@ func TestOrderRouterLimitsInvalidTokensBeforeVerification(t *testing.T) {
 	t.Parallel()
 	router, err := NewOrderRouter(OrderDependencies{
 		Logger: slog.New(slog.NewJSONHandler(io.Discard, nil)), ServiceName: "order-service",
-		ReadinessCheck: func(context.Context) error { return nil }, ReadinessTimeout: time.Second,
+		ReadinessChecks: map[string]func(context.Context) error{"postgres": func(context.Context) error { return nil }}, ReadinessTimeout: time.Second,
 		CommerceService: &stubCommerceService{},
 		TokenVerifier:   stubTokenVerifier{err: auth.ErrInvalidAccessToken},
 		RateLimit: RateLimitConfig{
@@ -235,7 +235,7 @@ func newOrderTestRouter(t *testing.T, principal auth.Principal, service Commerce
 	t.Helper()
 	router, err := NewOrderRouter(OrderDependencies{
 		Logger: slog.New(slog.NewJSONHandler(io.Discard, nil)), ServiceName: "order-service",
-		ReadinessCheck: func(context.Context) error { return nil }, ReadinessTimeout: time.Second,
+		ReadinessChecks: map[string]func(context.Context) error{"postgres": func(context.Context) error { return nil }}, ReadinessTimeout: time.Second,
 		CommerceService: service, TokenVerifier: stubTokenVerifier{principal: principal},
 		RateLimit: RateLimitConfig{RequestsPerSecond: 1000, Burst: 100, EntryTTL: time.Minute, MaxEntries: 100},
 		Now:       func() time.Time { return transportTestNow },
@@ -253,6 +253,9 @@ func performOrderRequest(handler http.Handler, method, path, body, token string)
 	}
 	if token != "" {
 		request.Header.Set("Authorization", "Bearer "+token)
+	}
+	if method == http.MethodPost && path == "/v1/orders" {
+		request.Header.Set("Idempotency-Key", "order-handler-test-key")
 	}
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)

@@ -21,10 +21,12 @@ type Config struct {
 	Environment string
 	ServiceName string
 	HTTP        HTTPConfig
+	GRPC        GRPCConfig
 	Database    DatabaseConfig
 	Log         LogConfig
 	Auth        AuthConfig
 	Commerce    CommerceConfig
+	Payment     CommerceConfig
 }
 
 type HTTPConfig struct {
@@ -38,17 +40,31 @@ type HTTPConfig struct {
 	ShutdownTimeout   time.Duration
 }
 
+type GRPCConfig struct {
+	Address              string
+	IdentityTarget       string
+	CallTimeout          time.Duration
+	RequestTimeout       time.Duration
+	ShutdownTimeout      time.Duration
+	TLSCertFile          string
+	TLSKeyFile           string
+	TLSCAFile            string
+	TLSServerName        string
+	TLSAllowedClientURIs []string
+}
+
 type DatabaseConfig struct {
-	URL                   string
-	MaxConns              int32
-	MinIdleConns          int32
-	MaxConnLifetime       time.Duration
-	MaxConnLifetimeJitter time.Duration
-	MaxConnIdleTime       time.Duration
-	HealthCheckPeriod     time.Duration
-	PingTimeout           time.Duration
-	OperationTimeout      time.Duration
-	LockTimeout           time.Duration
+	URL                     string
+	MaxConns                int32
+	MinIdleConns            int32
+	MaxConnLifetime         time.Duration
+	MaxConnLifetimeJitter   time.Duration
+	MaxConnIdleTime         time.Duration
+	HealthCheckPeriod       time.Duration
+	PingTimeout             time.Duration
+	OperationTimeout        time.Duration
+	LockTimeout             time.Duration
+	CommitResolutionTimeout time.Duration
 }
 
 type LogConfig struct {
@@ -101,6 +117,9 @@ func LoadForService(defaultServiceName, defaultHTTPAddress string) (Config, erro
 }
 
 func loadWithDefaults(lookup lookupEnv, defaultServiceName, defaultHTTPAddress string) (Config, error) {
+	isIdentityService := defaultServiceName == "user-service"
+	isOrderService := defaultServiceName == "order-service"
+	isPaymentService := defaultServiceName == "payment-service"
 	environment := strings.ToLower(valueOrDefault(lookup, "APP_ENV", "local"))
 	switch environment {
 	case "local", "test", "production":
@@ -143,6 +162,81 @@ func loadWithDefaults(lookup lookupEnv, defaultServiceName, defaultHTTPAddress s
 	if environment == "production" && tlsCertFile == "" {
 		return Config{}, fmt.Errorf("HTTP TLS certificate and key are required in production")
 	}
+	if tlsCertFile == "" && !isLoopbackAddress(httpAddress) {
+		return Config{}, fmt.Errorf("HTTP_ADDR must be loopback when HTTP TLS is disabled")
+	}
+	var grpcAddress string
+	var identityTarget string
+	var grpcCallTimeout time.Duration
+	var grpcRequestTimeout time.Duration
+	var grpcShutdownTimeout time.Duration
+	var err error
+	if isIdentityService {
+		grpcAddress = valueOrDefault(lookup, "GRPC_ADDR", "127.0.0.1:9091")
+		if err := validateNetworkAddress("GRPC_ADDR", grpcAddress); err != nil {
+			return Config{}, err
+		}
+		grpcRequestTimeout, err = boundedDuration(
+			lookup, "GRPC_REQUEST_TIMEOUT", 2*time.Second, 100*time.Millisecond, 10*time.Second,
+		)
+		if err != nil {
+			return Config{}, err
+		}
+		grpcShutdownTimeout, err = boundedDuration(
+			lookup, "GRPC_SHUTDOWN_TIMEOUT", 10*time.Second, time.Second, 30*time.Second,
+		)
+		if err != nil {
+			return Config{}, err
+		}
+	} else {
+		identityTarget = valueOrDefault(lookup, "IDENTITY_GRPC_TARGET", "127.0.0.1:9091")
+		if err := validateNetworkAddress("IDENTITY_GRPC_TARGET", identityTarget); err != nil {
+			return Config{}, err
+		}
+		grpcCallTimeout, err = boundedDuration(
+			lookup, "GRPC_CALL_TIMEOUT", time.Second, 100*time.Millisecond, 5*time.Second,
+		)
+		if err != nil {
+			return Config{}, err
+		}
+	}
+	grpcTLSCertFile := valueOrDefault(lookup, "GRPC_TLS_CERT_FILE", "")
+	grpcTLSKeyFile := valueOrDefault(lookup, "GRPC_TLS_KEY_FILE", "")
+	grpcTLSCAFile := valueOrDefault(lookup, "GRPC_TLS_CA_FILE", "")
+	var grpcTLSServerName string
+	var grpcTLSAllowedClientURIs []string
+	if isIdentityService {
+		grpcTLSAllowedClientURIs, err = allowedSPIFFEURIs(valueOrDefault(lookup, "GRPC_TLS_ALLOWED_CLIENT_URIS", ""))
+		if err != nil {
+			return Config{}, err
+		}
+	} else {
+		grpcTLSServerName = valueOrDefault(lookup, "GRPC_TLS_SERVER_NAME", "")
+	}
+	grpcTLSConfigured := grpcTLSCertFile != "" || grpcTLSKeyFile != "" || grpcTLSCAFile != ""
+	if grpcTLSConfigured && (grpcTLSCertFile == "" || grpcTLSKeyFile == "" || grpcTLSCAFile == "") {
+		return Config{}, fmt.Errorf("GRPC_TLS_CERT_FILE, GRPC_TLS_KEY_FILE, and GRPC_TLS_CA_FILE must be configured together")
+	}
+	if environment == "production" && !grpcTLSConfigured {
+		return Config{}, fmt.Errorf("gRPC mutual TLS certificate, key, and CA are required in production")
+	}
+	if !isIdentityService && grpcTLSConfigured && grpcTLSServerName == "" {
+		return Config{}, fmt.Errorf("GRPC_TLS_SERVER_NAME is required for a TLS identity client")
+	}
+	if isIdentityService && grpcTLSConfigured && len(grpcTLSAllowedClientURIs) == 0 {
+		return Config{}, fmt.Errorf("GRPC_TLS_ALLOWED_CLIENT_URIS is required for the identity gRPC server")
+	}
+	if !grpcTLSConfigured {
+		plaintextAddress := identityTarget
+		plaintextName := "IDENTITY_GRPC_TARGET"
+		if isIdentityService {
+			plaintextAddress = grpcAddress
+			plaintextName = "GRPC_ADDR"
+		}
+		if !isLoopbackAddress(plaintextAddress) {
+			return Config{}, fmt.Errorf("%s must be loopback when gRPC TLS is disabled", plaintextName)
+		}
+	}
 
 	readHeaderTimeout, err := positiveDuration(lookup, "HTTP_READ_HEADER_TIMEOUT", 5*time.Second)
 	if err != nil {
@@ -152,7 +246,7 @@ func loadWithDefaults(lookup lookupEnv, defaultServiceName, defaultHTTPAddress s
 	if err != nil {
 		return Config{}, err
 	}
-	writeTimeout, err := positiveDuration(lookup, "HTTP_WRITE_TIMEOUT", 15*time.Second)
+	writeTimeout, err := positiveDuration(lookup, "HTTP_WRITE_TIMEOUT", 20*time.Second)
 	if err != nil {
 		return Config{}, err
 	}
@@ -166,6 +260,9 @@ func loadWithDefaults(lookup lookupEnv, defaultServiceName, defaultHTTPAddress s
 	}
 	if shutdownTimeout < writeTimeout {
 		return Config{}, fmt.Errorf("HTTP_SHUTDOWN_TIMEOUT must be greater than or equal to HTTP_WRITE_TIMEOUT")
+	}
+	if !isIdentityService && grpcCallTimeout >= writeTimeout {
+		return Config{}, fmt.Errorf("GRPC_CALL_TIMEOUT must be shorter than HTTP_WRITE_TIMEOUT")
 	}
 
 	maxConns, err := integer(lookup, "DB_MAX_CONNS", 20, 1, 200)
@@ -220,87 +317,47 @@ func loadWithDefaults(lookup lookupEnv, defaultServiceName, defaultHTTPAddress s
 	if lockTimeout >= operationTimeout {
 		return Config{}, fmt.Errorf("DB_LOCK_TIMEOUT must be shorter than DB_OPERATION_TIMEOUT")
 	}
+	commitResolutionTimeout, err := boundedDuration(
+		lookup, "DB_COMMIT_RESOLUTION_TIMEOUT", 2*time.Second, 100*time.Millisecond, 5*time.Second,
+	)
+	if err != nil {
+		return Config{}, err
+	}
+	if operationTimeout+commitResolutionTimeout >= writeTimeout {
+		return Config{}, fmt.Errorf("DB_OPERATION_TIMEOUT plus DB_COMMIT_RESOLUTION_TIMEOUT must be shorter than HTTP_WRITE_TIMEOUT")
+	}
+	requestBudget := readTimeout + operationTimeout + 500*time.Millisecond
+	if !isIdentityService {
+		requestBudget += grpcCallTimeout + commitResolutionTimeout
+	}
+	if requestBudget >= writeTimeout {
+		return Config{}, fmt.Errorf("request read, gRPC, database, and response budgets must fit within HTTP_WRITE_TIMEOUT")
+	}
 
-	pasetoKey, ok := lookup("PASETO_V4_LOCAL_KEY")
-	pasetoKey = strings.TrimSpace(pasetoKey)
-	decodedKey, keyErr := hex.DecodeString(pasetoKey)
-	if !ok || keyErr != nil || len(decodedKey) != 32 {
-		return Config{}, fmt.Errorf("PASETO_V4_LOCAL_KEY must be a 32-byte hex key")
+	var authConfig AuthConfig
+	if isIdentityService {
+		authConfig, err = loadAuthConfig(lookup)
+		if err != nil {
+			return Config{}, err
+		}
+	} else if key, configured := lookup("PASETO_V4_LOCAL_KEY"); configured && strings.TrimSpace(key) != "" {
+		return Config{}, fmt.Errorf("PASETO_V4_LOCAL_KEY must not be configured outside user-service")
 	}
-	issuer := valueOrDefault(lookup, "TOKEN_ISSUER", "distributed-commerce/user-service")
-	if issuer == "" || len(issuer) > 128 || strings.ContainsAny(issuer, "\r\n\t") {
-		return Config{}, fmt.Errorf("TOKEN_ISSUER must be between 1 and 128 characters")
+	var commerceConfig CommerceConfig
+	if isOrderService {
+		rateLimit, err := loadRateLimitConfig(lookup, "COMMERCE", 20, 40, 1000)
+		if err != nil {
+			return Config{}, err
+		}
+		commerceConfig.RateLimit = rateLimit
 	}
-	accessTokenTTL, err := boundedDuration(lookup, "ACCESS_TOKEN_TTL", 15*time.Minute, time.Minute, time.Hour)
-	if err != nil {
-		return Config{}, err
-	}
-	refreshTokenTTL, err := boundedDuration(lookup, "REFRESH_TOKEN_TTL", 7*24*time.Hour, time.Hour, 90*24*time.Hour)
-	if err != nil {
-		return Config{}, err
-	}
-	if refreshTokenTTL <= accessTokenTTL {
-		return Config{}, fmt.Errorf("REFRESH_TOKEN_TTL must exceed ACCESS_TOKEN_TTL")
-	}
-	clockSkew, err := boundedNonNegativeDuration(lookup, "TOKEN_CLOCK_SKEW", 30*time.Second, 5*time.Minute)
-	if err != nil {
-		return Config{}, err
-	}
-	refreshReuseGrace, err := boundedNonNegativeDuration(lookup, "REFRESH_REUSE_GRACE", 5*time.Second, time.Minute)
-	if err != nil {
-		return Config{}, err
-	}
-	argon2Memory, err := integer(lookup, "ARGON2_MEMORY_KIB", 64*1024, 19*1024, 256*1024)
-	if err != nil {
-		return Config{}, err
-	}
-	argon2Iterations, err := integer(lookup, "ARGON2_ITERATIONS", 3, 1, 10)
-	if err != nil {
-		return Config{}, err
-	}
-	argon2Parallelism, err := integer(lookup, "ARGON2_PARALLELISM", 2, 1, 16)
-	if err != nil {
-		return Config{}, err
-	}
-	argon2MaxConcurrency, err := integer(lookup, "ARGON2_MAX_CONCURRENCY", 2, 1, 32)
-	if err != nil {
-		return Config{}, err
-	}
-	rateLimitRPS, err := decimal(lookup, "AUTH_RATE_LIMIT_RPS", 2, 0.1, 1000)
-	if err != nil {
-		return Config{}, err
-	}
-	rateLimitBurst, err := integer(lookup, "AUTH_RATE_LIMIT_BURST", 5, 1, 100)
-	if err != nil {
-		return Config{}, err
-	}
-	rateLimitEntryTTL, err := boundedDuration(lookup, "AUTH_RATE_LIMIT_ENTRY_TTL", 10*time.Minute, time.Minute, time.Hour)
-	if err != nil {
-		return Config{}, err
-	}
-	rateLimitMaxEntries, err := integer(lookup, "AUTH_RATE_LIMIT_MAX_ENTRIES", 10000, 100, 100000)
-	if err != nil {
-		return Config{}, err
-	}
-	commerceRateLimitRPS, err := decimal(lookup, "COMMERCE_RATE_LIMIT_RPS", 20, 0.1, 1000)
-	if err != nil {
-		return Config{}, err
-	}
-	commerceRateLimitBurst, err := integer(lookup, "COMMERCE_RATE_LIMIT_BURST", 40, 1, 1000)
-	if err != nil {
-		return Config{}, err
-	}
-	commerceRateLimitEntryTTL, err := boundedDuration(
-		lookup, "COMMERCE_RATE_LIMIT_ENTRY_TTL", 10*time.Minute, time.Minute, time.Hour,
-	)
-	if err != nil {
-		return Config{}, err
-	}
-	commerceRateLimitMaxEntries, err := integer(
-		lookup, "COMMERCE_RATE_LIMIT_MAX_ENTRIES", 10000, 100, 100000,
-	)
-	if err != nil {
-		return Config{}, err
+	var paymentConfig CommerceConfig
+	if isPaymentService {
+		rateLimit, err := loadRateLimitConfig(lookup, "PAYMENT", 10, 20, 1000)
+		if err != nil {
+			return Config{}, err
+		}
+		paymentConfig.RateLimit = rateLimit
 	}
 
 	return Config{
@@ -316,43 +373,118 @@ func loadWithDefaults(lookup lookupEnv, defaultServiceName, defaultHTTPAddress s
 			IdleTimeout:       idleTimeout,
 			ShutdownTimeout:   shutdownTimeout,
 		},
+		GRPC: GRPCConfig{
+			Address: grpcAddress, IdentityTarget: identityTarget,
+			CallTimeout: grpcCallTimeout, RequestTimeout: grpcRequestTimeout,
+			ShutdownTimeout: grpcShutdownTimeout,
+			TLSCertFile:     grpcTLSCertFile, TLSKeyFile: grpcTLSKeyFile,
+			TLSCAFile: grpcTLSCAFile, TLSServerName: grpcTLSServerName,
+			TLSAllowedClientURIs: grpcTLSAllowedClientURIs,
+		},
 		Database: DatabaseConfig{
-			URL:                   databaseURL,
-			MaxConns:              maxConns,
-			MinIdleConns:          minIdleConns,
-			MaxConnLifetime:       maxConnLifetime,
-			MaxConnLifetimeJitter: maxConnLifetimeJitter,
-			MaxConnIdleTime:       maxConnIdleTime,
-			HealthCheckPeriod:     healthCheckPeriod,
-			PingTimeout:           pingTimeout,
-			OperationTimeout:      operationTimeout,
-			LockTimeout:           lockTimeout,
+			URL:                     databaseURL,
+			MaxConns:                maxConns,
+			MinIdleConns:            minIdleConns,
+			MaxConnLifetime:         maxConnLifetime,
+			MaxConnLifetimeJitter:   maxConnLifetimeJitter,
+			MaxConnIdleTime:         maxConnIdleTime,
+			HealthCheckPeriod:       healthCheckPeriod,
+			PingTimeout:             pingTimeout,
+			OperationTimeout:        operationTimeout,
+			LockTimeout:             lockTimeout,
+			CommitResolutionTimeout: commitResolutionTimeout,
 		},
-		Log: LogConfig{Level: logLevel},
-		Auth: AuthConfig{
-			PasetoV4LocalKey:     pasetoKey,
-			Issuer:               issuer,
-			AccessTokenTTL:       accessTokenTTL,
-			RefreshTokenTTL:      refreshTokenTTL,
-			ClockSkew:            clockSkew,
-			RefreshReuseGrace:    refreshReuseGrace,
-			Argon2MemoryKiB:      uint32(argon2Memory),
-			Argon2Iterations:     uint32(argon2Iterations),
-			Argon2Parallelism:    uint8(argon2Parallelism),
-			Argon2MaxConcurrency: int(argon2MaxConcurrency),
-			RateLimit: RateLimitConfig{
-				RequestsPerSecond: rateLimitRPS,
-				Burst:             int(rateLimitBurst),
-				EntryTTL:          rateLimitEntryTTL,
-				MaxEntries:        int(rateLimitMaxEntries),
-			},
-		},
-		Commerce: CommerceConfig{RateLimit: RateLimitConfig{
-			RequestsPerSecond: commerceRateLimitRPS,
-			Burst:             int(commerceRateLimitBurst),
-			EntryTTL:          commerceRateLimitEntryTTL,
-			MaxEntries:        int(commerceRateLimitMaxEntries),
-		}},
+		Log:  LogConfig{Level: logLevel},
+		Auth: authConfig, Commerce: commerceConfig, Payment: paymentConfig,
+	}, nil
+}
+
+func loadAuthConfig(lookup lookupEnv) (AuthConfig, error) {
+	pasetoKey, ok := lookup("PASETO_V4_LOCAL_KEY")
+	pasetoKey = strings.TrimSpace(pasetoKey)
+	decodedKey, keyErr := hex.DecodeString(pasetoKey)
+	if !ok || keyErr != nil || len(decodedKey) != 32 {
+		return AuthConfig{}, fmt.Errorf("PASETO_V4_LOCAL_KEY must be a 32-byte hex key")
+	}
+	issuer := valueOrDefault(lookup, "TOKEN_ISSUER", "distributed-commerce/user-service")
+	if issuer == "" || len(issuer) > 128 || strings.ContainsAny(issuer, "\r\n\t") {
+		return AuthConfig{}, fmt.Errorf("TOKEN_ISSUER must be between 1 and 128 characters")
+	}
+	accessTokenTTL, err := boundedDuration(lookup, "ACCESS_TOKEN_TTL", 15*time.Minute, time.Minute, time.Hour)
+	if err != nil {
+		return AuthConfig{}, err
+	}
+	refreshTokenTTL, err := boundedDuration(lookup, "REFRESH_TOKEN_TTL", 7*24*time.Hour, time.Hour, 90*24*time.Hour)
+	if err != nil {
+		return AuthConfig{}, err
+	}
+	if refreshTokenTTL <= accessTokenTTL {
+		return AuthConfig{}, fmt.Errorf("REFRESH_TOKEN_TTL must exceed ACCESS_TOKEN_TTL")
+	}
+	clockSkew, err := boundedNonNegativeDuration(lookup, "TOKEN_CLOCK_SKEW", 30*time.Second, 5*time.Minute)
+	if err != nil {
+		return AuthConfig{}, err
+	}
+	refreshReuseGrace, err := boundedNonNegativeDuration(lookup, "REFRESH_REUSE_GRACE", 5*time.Second, time.Minute)
+	if err != nil {
+		return AuthConfig{}, err
+	}
+	argon2Memory, err := integer(lookup, "ARGON2_MEMORY_KIB", 64*1024, 19*1024, 256*1024)
+	if err != nil {
+		return AuthConfig{}, err
+	}
+	argon2Iterations, err := integer(lookup, "ARGON2_ITERATIONS", 3, 1, 10)
+	if err != nil {
+		return AuthConfig{}, err
+	}
+	argon2Parallelism, err := integer(lookup, "ARGON2_PARALLELISM", 2, 1, 16)
+	if err != nil {
+		return AuthConfig{}, err
+	}
+	argon2MaxConcurrency, err := integer(lookup, "ARGON2_MAX_CONCURRENCY", 2, 1, 32)
+	if err != nil {
+		return AuthConfig{}, err
+	}
+	rateLimit, err := loadRateLimitConfig(lookup, "AUTH", 2, 5, 100)
+	if err != nil {
+		return AuthConfig{}, err
+	}
+	return AuthConfig{
+		PasetoV4LocalKey: pasetoKey, Issuer: issuer,
+		AccessTokenTTL: accessTokenTTL, RefreshTokenTTL: refreshTokenTTL,
+		ClockSkew: clockSkew, RefreshReuseGrace: refreshReuseGrace,
+		Argon2MemoryKiB: uint32(argon2Memory), Argon2Iterations: uint32(argon2Iterations),
+		Argon2Parallelism: uint8(argon2Parallelism), Argon2MaxConcurrency: int(argon2MaxConcurrency),
+		RateLimit: rateLimit,
+	}, nil
+}
+
+func loadRateLimitConfig(
+	lookup lookupEnv,
+	prefix string,
+	defaultRPS float64,
+	defaultBurst, maximumBurst int32,
+) (RateLimitConfig, error) {
+	rps, err := decimal(lookup, prefix+"_RATE_LIMIT_RPS", defaultRPS, 0.1, 1000)
+	if err != nil {
+		return RateLimitConfig{}, err
+	}
+	burst, err := integer(lookup, prefix+"_RATE_LIMIT_BURST", defaultBurst, 1, maximumBurst)
+	if err != nil {
+		return RateLimitConfig{}, err
+	}
+	entryTTL, err := boundedDuration(
+		lookup, prefix+"_RATE_LIMIT_ENTRY_TTL", 10*time.Minute, time.Minute, time.Hour,
+	)
+	if err != nil {
+		return RateLimitConfig{}, err
+	}
+	maxEntries, err := integer(lookup, prefix+"_RATE_LIMIT_MAX_ENTRIES", 10000, 100, 100000)
+	if err != nil {
+		return RateLimitConfig{}, err
+	}
+	return RateLimitConfig{
+		RequestsPerSecond: rps, Burst: int(burst), EntryTTL: entryTTL, MaxEntries: int(maxEntries),
 	}, nil
 }
 
@@ -438,16 +570,95 @@ func decimal(lookup lookupEnv, key string, fallback, minimum, maximum float64) (
 }
 
 func validateHTTPAddress(address string) error {
+	return validateNetworkAddress("HTTP_ADDR", address)
+}
+
+func validateNetworkAddress(name, address string) error {
 	_, port, err := net.SplitHostPort(address)
 	if err != nil {
-		return fmt.Errorf("HTTP_ADDR must be a host:port listen address")
+		return fmt.Errorf("%s must be a host:port address", name)
 	}
 
 	portNumber, err := strconv.Atoi(port)
 	if err != nil || portNumber < 1 || portNumber > 65535 {
-		return fmt.Errorf("HTTP_ADDR must contain a numeric port between 1 and 65535")
+		return fmt.Errorf("%s must contain a numeric port between 1 and 65535", name)
 	}
 	return nil
+}
+
+func isLoopbackAddress(address string) bool {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func allowedSPIFFEURIs(raw string) ([]string, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	parts := strings.Split(raw, ",")
+	if len(parts) > 16 {
+		return nil, fmt.Errorf("GRPC_TLS_ALLOWED_CLIENT_URIS must contain at most 16 values")
+	}
+	seen := make(map[string]struct{}, len(parts))
+	values := make([]string, 0, len(parts))
+	for _, part := range parts {
+		value := strings.TrimSpace(part)
+		parsed, err := url.Parse(value)
+		if err != nil || !canonicalSPIFFEURI(parsed, value) {
+			return nil, fmt.Errorf("GRPC_TLS_ALLOWED_CLIENT_URIS must contain canonical SPIFFE URIs")
+		}
+		if _, duplicate := seen[value]; duplicate {
+			return nil, fmt.Errorf("GRPC_TLS_ALLOWED_CLIENT_URIS must not contain duplicates")
+		}
+		seen[value] = struct{}{}
+		values = append(values, value)
+	}
+	return values, nil
+}
+
+func canonicalSPIFFEURI(parsed *url.URL, value string) bool {
+	if parsed.Scheme != "spiffe" || parsed.Opaque != "" || parsed.User != nil ||
+		parsed.Host == "" || parsed.Host != parsed.Hostname() || !validSPIFFETrustDomain(parsed.Host) ||
+		parsed.RawPath != "" || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" ||
+		parsed.Path == "" || parsed.Path == "/" || parsed.String() != value {
+		return false
+	}
+	for _, segment := range strings.Split(strings.TrimPrefix(parsed.Path, "/"), "/") {
+		if segment == "" || segment == "." || segment == ".." {
+			return false
+		}
+		for index := range len(segment) {
+			character := segment[index]
+			if !asciiLetterOrDigit(character) && character != '-' && character != '_' && character != '.' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func validSPIFFETrustDomain(value string) bool {
+	if len(value) == 0 || len(value) > 255 || value != strings.ToLower(value) {
+		return false
+	}
+	for index := range len(value) {
+		character := value[index]
+		if !asciiLetterOrDigit(character) && character != '.' && character != '-' && character != '_' {
+			return false
+		}
+	}
+	return true
+}
+
+func asciiLetterOrDigit(value byte) bool {
+	return value >= 'a' && value <= 'z' || value >= 'A' && value <= 'Z' || value >= '0' && value <= '9'
 }
 
 func validateProductionDatabaseURL(databaseURL string) error {

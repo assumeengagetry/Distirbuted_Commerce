@@ -78,15 +78,16 @@ func TestNewPoolConfigDoesNotExposeInvalidURL(t *testing.T) {
 
 func databaseConfig(url string) config.DatabaseConfig {
 	return config.DatabaseConfig{
-		URL:                   url,
-		MaxConns:              20,
-		MinIdleConns:          2,
-		MaxConnLifetime:       time.Hour,
-		MaxConnLifetimeJitter: 5 * time.Minute,
-		MaxConnIdleTime:       30 * time.Minute,
-		HealthCheckPeriod:     time.Minute,
-		PingTimeout:           2 * time.Second,
-		OperationTimeout:      5 * time.Second,
-		LockTimeout:           2 * time.Second,
+		URL:                     url,
+		MaxConns:                20,
+		MinIdleConns:            2,
+		MaxConnLifetime:         time.Hour,
+		MaxConnLifetimeJitter:   5 * time.Minute,
+		MaxConnIdleTime:         30 * time.Minute,
+		HealthCheckPeriod:       time.Minute,
+		PingTimeout:             2 * time.Second,
+		OperationTimeout:        5 * time.Second,
+		LockTimeout:             2 * time.Second,
+		CommitResolutionTimeout: 2 * time.Second,
 	}
 }

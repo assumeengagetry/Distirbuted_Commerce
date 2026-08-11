@@ -263,6 +263,10 @@ func (h commerceHandler) writeServiceError(c *gin.Context, err error) {
 		writeAPIError(c, http.StatusBadRequest, "INVALID_ORDER_ITEMS", err.Error())
 	case errors.Is(err, commerce.ErrInvalidItemQuantity):
 		writeAPIError(c, http.StatusBadRequest, "INVALID_ITEM_QUANTITY", err.Error())
+	case errors.Is(err, commerce.ErrIdempotencyKeyRequired):
+		writeAPIError(c, http.StatusBadRequest, "IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key header is required")
+	case errors.Is(err, commerce.ErrInvalidIdempotencyKey):
+		writeAPIError(c, http.StatusBadRequest, "INVALID_IDEMPOTENCY_KEY", "Idempotency-Key header is invalid")
 	case errors.Is(err, commerce.ErrInvalidPage):
 		writeAPIError(c, http.StatusBadRequest, "INVALID_QUERY", "invalid pagination parameters")
 	case errors.Is(err, commerce.ErrInvalidActor):
@@ -291,6 +295,14 @@ func (h commerceHandler) writeServiceError(c *gin.Context, err error) {
 		writeAPIError(c, http.StatusConflict, "PRODUCT_CHANGED", "product changed; refresh the catalog")
 	case errors.Is(err, commerce.ErrInsufficientInventory):
 		writeAPIError(c, http.StatusConflict, "INSUFFICIENT_INVENTORY", "insufficient inventory")
+	case errors.Is(err, commerce.ErrIdempotencyConflict):
+		writeAPIError(c, http.StatusConflict, "IDEMPOTENCY_KEY_REUSED", "idempotency key was used for a different request")
+	case errors.Is(err, commerce.ErrIdempotencyInProgress):
+		c.Header("Retry-After", "1")
+		writeAPIError(c, http.StatusConflict, "IDEMPOTENCY_IN_PROGRESS", "idempotent operation is still in progress")
+	case errors.Is(err, commerce.ErrOperationOutcomeUnknown):
+		c.Header("Retry-After", "1")
+		writeAPIError(c, http.StatusServiceUnavailable, "OPERATION_OUTCOME_UNKNOWN", "retry the same request with the same idempotency key")
 	case errors.Is(err, commerce.ErrCurrencyMismatch):
 		writeAPIError(c, http.StatusConflict, "CURRENCY_MISMATCH", "product currency does not match account")
 	case errors.Is(err, commerce.ErrOrderAmountTooLarge):

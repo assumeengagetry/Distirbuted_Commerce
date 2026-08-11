@@ -46,6 +46,9 @@ func TestRegisterHandler(t *testing.T) {
 	if response.Header().Get(requestIDHeader) != requestID {
 		t.Errorf("response request ID = %q, want %q", response.Header().Get(requestIDHeader), requestID)
 	}
+	if response.Header().Get("Cache-Control") != "no-store" {
+		t.Errorf("Cache-Control = %q, want no-store", response.Header().Get("Cache-Control"))
+	}
 	if captured.Email != "alice@example.com" || captured.Password != "a-secure-password" || captured.DisplayName != "Alice" {
 		t.Errorf("captured request = %+v", captured)
 	}
@@ -58,6 +61,24 @@ func TestRegisterHandler(t *testing.T) {
 	}
 	if body.User.ID != result.Profile.User.ID || body.Account.Balance != 0 || body.Tokens.TokenType != "Bearer" {
 		t.Errorf("response = %+v", body)
+	}
+}
+
+func TestJSONDecoderAcceptsValidReplacementCharacter(t *testing.T) {
+	t.Parallel()
+	router := routerWithService(t, &stubUserService{}, stubTokenVerifier{}, RateLimitConfig{
+		RequestsPerSecond: 100, Burst: 10, EntryTTL: time.Minute, MaxEntries: 100,
+	})
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/v1/auth/register",
+		strings.NewReader(`{"email":"unicode@example.com","password":"a-secure-password","display_name":"A\ufffd"}`),
+	)
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body=%s", response.Code, response.Body.String())
 	}
 }
 
@@ -195,7 +216,7 @@ func TestAuthenticationMiddlewareAndCurrentUser(t *testing.T) {
 		t.Fatalf("status = %d, want 200; body=%s", response.Code, response.Body.String())
 	}
 
-	for _, headers := range [][]string{nil, {"Basic value"}, {"Bearer one", "Bearer two"}} {
+	for _, headers := range [][]string{nil, {"Basic value"}, {"Bearer one", "Bearer two"}, {string([]byte{'B', 'e', 'a', 'r', 'e', 'r', ' ', 0xff})}} {
 		request := httptest.NewRequest(http.MethodGet, "/v1/users/me", nil)
 		for _, header := range headers {
 			request.Header.Add("Authorization", header)
@@ -203,6 +224,21 @@ func TestAuthenticationMiddlewareAndCurrentUser(t *testing.T) {
 		response := httptest.NewRecorder()
 		router.ServeHTTP(response, request)
 		assertAPIError(t, response, http.StatusUnauthorized, "UNAUTHORIZED")
+	}
+}
+
+func TestAuthenticationMiddlewareMapsIdentityOutage(t *testing.T) {
+	t.Parallel()
+	router := routerWithService(t, &stubUserService{}, stubTokenVerifier{
+		err: auth.ErrAccessTokenVerifierUnavailable,
+	}, RateLimitConfig{RequestsPerSecond: 100, Burst: 10, EntryTTL: time.Minute, MaxEntries: 100})
+	request := httptest.NewRequest(http.MethodGet, "/v1/users/me", nil)
+	request.Header.Set("Authorization", "Bearer token")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	assertAPIError(t, response, http.StatusServiceUnavailable, "IDENTITY_UNAVAILABLE")
+	if response.Header().Get("Retry-After") != "1" || response.Header().Get("WWW-Authenticate") != "" {
+		t.Fatalf("identity outage headers = %v", response.Header())
 	}
 }
 

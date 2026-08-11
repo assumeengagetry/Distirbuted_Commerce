@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -8,6 +9,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"aidanwoods.dev/go-paseto"
 	"github.com/google/uuid"
@@ -22,8 +24,9 @@ const (
 )
 
 var (
-	ErrInvalidAccessToken  = errors.New("invalid access token")
-	ErrInvalidRefreshToken = errors.New("invalid refresh token")
+	ErrInvalidAccessToken             = errors.New("invalid access token")
+	ErrAccessTokenVerifierUnavailable = errors.New("access token verifier unavailable")
+	ErrInvalidRefreshToken            = errors.New("invalid refresh token")
 )
 
 var accessImplicitAssertion = []byte("distributed-commerce/user-service/access/v1")
@@ -85,7 +88,7 @@ func (m *TokenManager) IssueAccess(userID uuid.UUID, role string, now time.Time)
 }
 
 func (m *TokenManager) ParseAccess(encoded string, now time.Time) (Principal, error) {
-	if len(encoded) == 0 || len(encoded) > maximumAccessTokenSize {
+	if !ValidAccessTokenLength(encoded) {
 		return Principal{}, ErrInvalidAccessToken
 	}
 
@@ -122,6 +125,17 @@ func (m *TokenManager) ParseAccess(encoded string, now time.Time) (Principal, er
 	}
 
 	return Principal{UserID: userID, Role: role, TokenID: tokenID}, nil
+}
+
+func ValidAccessTokenLength(encoded string) bool {
+	return len(encoded) > 0 && len(encoded) <= maximumAccessTokenSize && utf8.ValidString(encoded)
+}
+
+func (m *TokenManager) VerifyAccess(ctx context.Context, encoded string) (Principal, error) {
+	if err := ctx.Err(); err != nil {
+		return Principal{}, fmt.Errorf("%w: %v", ErrAccessTokenVerifierUnavailable, err)
+	}
+	return m.ParseAccess(encoded, time.Now())
 }
 
 func (m *TokenManager) validAccessTime(now time.Time) paseto.Rule {

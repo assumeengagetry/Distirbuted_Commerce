@@ -9,10 +9,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/assumeengagetry/distributed-commerce/internal/auth"
 	"github.com/assumeengagetry/distributed-commerce/internal/config"
 	"github.com/assumeengagetry/distributed-commerce/internal/database"
 	store "github.com/assumeengagetry/distributed-commerce/internal/database/sqlc"
+	"github.com/assumeengagetry/distributed-commerce/internal/identity"
 	"github.com/assumeengagetry/distributed-commerce/internal/observability"
 	commerce "github.com/assumeengagetry/distributed-commerce/internal/order"
 	"github.com/assumeengagetry/distributed-commerce/internal/platform/httpserver"
@@ -45,7 +45,7 @@ func run() error {
 	}
 	defer pool.Close()
 	queries := store.New(pool)
-	readinessCheck := func(ctx context.Context) error {
+	postgresReadiness := func(ctx context.Context) error {
 		value, err := queries.OrderHealthCheck(ctx)
 		if err != nil {
 			return err
@@ -56,14 +56,20 @@ func run() error {
 		return nil
 	}
 
-	tokens, err := auth.NewTokenManager(
-		cfg.Auth.PasetoV4LocalKey, cfg.Auth.Issuer, cfg.Auth.AccessTokenTTL, cfg.Auth.ClockSkew,
-	)
+	identityClient, err := identity.Dial(identity.ClientConfig{
+		Target: cfg.GRPC.IdentityTarget, Timeout: cfg.GRPC.CallTimeout,
+		TLSCertFile: cfg.GRPC.TLSCertFile, TLSKeyFile: cfg.GRPC.TLSKeyFile,
+		TLSCAFile: cfg.GRPC.TLSCAFile, TLSServerName: cfg.GRPC.TLSServerName,
+		Logger: logger,
+	})
 	if err != nil {
-		return fmt.Errorf("create token manager: %w", err)
+		return fmt.Errorf("create identity gRPC client: %w", err)
 	}
+	defer identityClient.Close()
 	service, err := commerce.NewService(
-		database.NewOrderRepository(pool, cfg.Database.LockTimeout, cfg.Database.OperationTimeout),
+		database.NewOrderRepository(
+			pool, cfg.Database.LockTimeout, cfg.Database.OperationTimeout, cfg.Database.CommitResolutionTimeout,
+		),
 		logger,
 		cfg.Database.OperationTimeout,
 	)
@@ -72,8 +78,11 @@ func run() error {
 	}
 	router, err := httptransport.NewOrderRouter(httptransport.OrderDependencies{
 		Logger: logger, ServiceName: cfg.ServiceName,
-		ReadinessCheck: readinessCheck, ReadinessTimeout: cfg.Database.PingTimeout,
-		CommerceService: service, TokenVerifier: tokens,
+		ReadinessChecks: map[string]func(context.Context) error{
+			"postgres": postgresReadiness, "identity_grpc": identityClient.Health,
+		},
+		ReadinessTimeout: cfg.Database.PingTimeout,
+		CommerceService:  service, TokenVerifier: identityClient,
 		RateLimit: httptransport.RateLimitConfig{
 			RequestsPerSecond: cfg.Commerce.RateLimit.RequestsPerSecond,
 			Burst:             cfg.Commerce.RateLimit.Burst, EntryTTL: cfg.Commerce.RateLimit.EntryTTL,

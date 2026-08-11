@@ -109,6 +109,29 @@ func TestReadinessEnforcesTimeout(t *testing.T) {
 	}
 }
 
+func TestReadinessReportsEachDependency(t *testing.T) {
+	t.Parallel()
+	deps := baseTestDependencies(func(context.Context) error { return nil }, time.Second)
+	deps.ReadinessChecks["identity_grpc"] = func(context.Context) error { return context.Canceled }
+	router, err := NewRouter(deps)
+	if err != nil {
+		t.Fatalf("NewRouter() error = %v", err)
+	}
+	request := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", response.Code)
+	}
+	var body healthResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if body.Checks["postgres"] != "up" || body.Checks["identity_grpc"] != "down" {
+		t.Fatalf("readiness checks = %+v", body.Checks)
+	}
+}
+
 func TestRecoveryDoesNotExposePanic(t *testing.T) {
 	t.Parallel()
 
@@ -140,7 +163,7 @@ func TestNewRouterValidatesDependencies(t *testing.T) {
 	}{
 		{name: "missing logger", mutate: func(deps *Dependencies) { deps.Logger = nil }},
 		{name: "missing service name", mutate: func(deps *Dependencies) { deps.ServiceName = "" }},
-		{name: "missing check", mutate: func(deps *Dependencies) { deps.ReadinessCheck = nil }},
+		{name: "missing check", mutate: func(deps *Dependencies) { deps.ReadinessChecks = nil }},
 		{name: "invalid timeout", mutate: func(deps *Dependencies) { deps.ReadinessTimeout = 0 }},
 		{name: "missing user service", mutate: func(deps *Dependencies) { deps.UserService = nil }},
 		{name: "missing verifier", mutate: func(deps *Dependencies) { deps.TokenVerifier = nil }},

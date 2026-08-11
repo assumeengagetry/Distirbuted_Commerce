@@ -1,0 +1,12 @@
+version: v2
+clean: true
+plugins:
+  - local: bin/protoc-gen-go-v1.36.11
+    out: internal/genproto
+    opt:
+      - paths=source_relative
+  - local: bin/protoc-gen-go-grpc-v1.6.0
+    out: internal/genproto
+    opt:
+      - paths=source_relative
+      - require_unimplemented_servers=true

@@ -10,6 +10,7 @@ readonly paseto_key_file="${secrets_dir}/paseto_v4_local_key"
 
 umask 077
 mkdir -p "${secrets_dir}"
+chmod 700 "${secrets_dir}"
 
 generate_secret() {
 	local destination="$1"
@@ -40,7 +41,11 @@ printf '%s' "${redis_password}" >"${redis_password_file}"
 printf '%s' "${paseto_key}" >"${paseto_key_file}"
 chmod 600 "${postgres_password_file}" "${redis_password_file}" "${paseto_key_file}"
 
-printf '127.0.0.1:5432:commerce:commerce:%s\n' "${postgres_password}" >"${secrets_dir}/pgpass"
+{
+	printf '127.0.0.1:5432:postgres:commerce:%s\n' "${postgres_password}"
+	printf '127.0.0.1:5432:commerce:commerce:%s\n' "${postgres_password}"
+	printf '127.0.0.1:5432:commerce_test:commerce:%s\n' "${postgres_password}"
+} >"${secrets_dir}/pgpass"
 chmod 600 "${secrets_dir}/pgpass"
 
 {
@@ -55,5 +60,6 @@ chmod 600 "${secrets_dir}/redis.conf"
 if [[ ! -f "${project_root}/.env" ]]; then
 	install -m 600 "${project_root}/.env.example" "${project_root}/.env"
 fi
+chmod 600 "${project_root}/.env"
 
 printf 'Local environment initialized without printing secret values.\n'

@@ -31,7 +31,12 @@ func (s ProductStatus) Valid() bool {
 
 type OrderStatus string
 
-const OrderStatusPending OrderStatus = "pending"
+const (
+	OrderStatusPending       OrderStatus = "pending"
+	OrderStatusPaid          OrderStatus = "paid"
+	OrderStatusPaymentFailed OrderStatus = "payment_failed"
+	OrderStatusCancelled     OrderStatus = "cancelled"
+)
 
 type Actor struct {
 	UserID uuid.UUID
@@ -101,14 +106,15 @@ type OrderItem struct {
 }
 
 type Order struct {
-	ID          uuid.UUID
-	UserID      uuid.UUID
-	Status      OrderStatus
-	Currency    string
-	TotalAmount int64
-	Items       []OrderItem
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
+	ID                uuid.UUID
+	UserID            uuid.UUID
+	Status            OrderStatus
+	Currency          string
+	TotalAmount       int64
+	Items             []OrderItem
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
+	IdempotencyReplay bool
 }
 
 type OrderPage struct {
@@ -152,10 +158,13 @@ type RequestedItem struct {
 }
 
 type CreateOrderRequest struct {
-	Items []RequestedItem
+	Items          []RequestedItem
+	IdempotencyKey string
 }
 
 type CreateOrderParams struct {
-	OrderID uuid.UUID
-	Items   []RequestedItem
+	OrderID     uuid.UUID
+	Items       []RequestedItem
+	KeyHash     []byte
+	RequestHash []byte
 }

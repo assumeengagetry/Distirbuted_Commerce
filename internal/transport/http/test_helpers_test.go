@@ -62,7 +62,7 @@ type stubTokenVerifier struct {
 	err       error
 }
 
-func (s stubTokenVerifier) ParseAccess(string, time.Time) (auth.Principal, error) {
+func (s stubTokenVerifier) VerifyAccess(context.Context, string) (auth.Principal, error) {
 	return s.principal, s.err
 }
 
@@ -70,7 +70,7 @@ func baseTestDependencies(check func(context.Context) error, timeout time.Durati
 	return Dependencies{
 		Logger:           slog.New(slog.NewJSONHandler(io.Discard, nil)),
 		ServiceName:      "user-service",
-		ReadinessCheck:   check,
+		ReadinessChecks:  map[string]func(context.Context) error{"postgres": check},
 		ReadinessTimeout: timeout,
 		UserService:      &stubUserService{},
 		TokenVerifier: stubTokenVerifier{principal: auth.Principal{

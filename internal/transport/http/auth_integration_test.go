@@ -68,7 +68,7 @@ func TestAuthenticationAPIIntegration(t *testing.T) {
 	queries := store.New(pool)
 	router, err := NewRouter(Dependencies{
 		Logger: logger, ServiceName: "user-service",
-		ReadinessCheck:   func(ctx context.Context) error { _, err := queries.HealthCheck(ctx); return err },
+		ReadinessChecks:  map[string]func(context.Context) error{"postgres": func(ctx context.Context) error { _, err := queries.HealthCheck(ctx); return err }},
 		ReadinessTimeout: 3 * time.Second,
 		UserService:      service, TokenVerifier: tokens,
 		AuthRateLimit: RateLimitConfig{RequestsPerSecond: 1000, Burst: 100, EntryTTL: time.Minute, MaxEntries: 100},
@@ -159,6 +159,16 @@ func TestAuthenticationAPIIntegration(t *testing.T) {
 }
 
 func performJSONRequest(t *testing.T, handler http.Handler, method, path string, body any, accessToken string) *httptest.ResponseRecorder {
+	return performJSONRequestWithIdempotency(t, handler, method, path, body, accessToken, "")
+}
+
+func performJSONRequestWithIdempotency(
+	t *testing.T,
+	handler http.Handler,
+	method, path string,
+	body any,
+	accessToken, idempotencyKey string,
+) *httptest.ResponseRecorder {
 	t.Helper()
 	var requestBody bytes.Reader
 	if body != nil {
@@ -174,6 +184,9 @@ func performJSONRequest(t *testing.T, handler http.Handler, method, path string,
 	}
 	if accessToken != "" {
 		request.Header.Set("Authorization", "Bearer "+accessToken)
+	}
+	if idempotencyKey != "" {
+		request.Header.Set("Idempotency-Key", idempotencyKey)
 	}
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)

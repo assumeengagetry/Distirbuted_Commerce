@@ -58,6 +58,7 @@ func TestTokenManagerRejectsInvalidAccessTokens(t *testing.T) {
 	}{
 		{name: "empty", manager: manager, token: "", now: now},
 		{name: "oversized", manager: manager, token: strings.Repeat("a", maximumAccessTokenSize+1), now: now},
+		{name: "non UTF-8", manager: manager, token: string([]byte{0xff}), now: now},
 		{name: "tampered", manager: manager, token: tampered, now: now},
 		{name: "wrong key", manager: otherManager, token: token, now: now},
 		{name: "expired beyond skew", manager: manager, token: token, now: now.Add(16 * time.Minute)},

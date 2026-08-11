@@ -28,7 +28,7 @@ type CommerceService interface {
 type OrderDependencies struct {
 	Logger           *slog.Logger
 	ServiceName      string
-	ReadinessCheck   func(context.Context) error
+	ReadinessChecks  map[string]func(context.Context) error
 	ReadinessTimeout time.Duration
 	CommerceService  CommerceService
 	TokenVerifier    AccessTokenVerifier
@@ -47,7 +47,7 @@ func NewOrderRouter(deps OrderDependencies) (*gin.Engine, error) {
 		return nil, fmt.Errorf("clock is required")
 	}
 	router, err := newBaseRouter(baseDependencies{
-		Logger: deps.Logger, ServiceName: deps.ServiceName, ReadinessCheck: deps.ReadinessCheck,
+		Logger: deps.Logger, ServiceName: deps.ServiceName, ReadinessChecks: deps.ReadinessChecks,
 		ReadinessTimeout: deps.ReadinessTimeout,
 	})
 	if err != nil {
@@ -70,7 +70,7 @@ func NewOrderRouter(deps OrderDependencies) (*gin.Engine, error) {
 	protected := router.Group(
 		"/v1",
 		rateLimitMiddleware(ipLimiter),
-		authenticate(deps.TokenVerifier, deps.Now),
+		authenticate(deps.TokenVerifier),
 		principalRateLimitMiddleware(principalLimiter),
 	)
 	protected.POST("/orders", requireRoles(commerce.RoleCustomer), handler.createOrder)

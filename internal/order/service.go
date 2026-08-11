@@ -3,6 +3,7 @@ package order
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"log/slog"
 	"regexp"
@@ -12,6 +13,8 @@ import (
 	"unicode/utf8"
 
 	"github.com/google/uuid"
+
+	"github.com/assumeengagetry/distributed-commerce/internal/idempotency"
 )
 
 var skuPattern = regexp.MustCompile(`^[A-Z0-9][A-Z0-9._-]{2,63}$`)
@@ -163,6 +166,12 @@ func (s *Service) CreateOrder(ctx context.Context, actor Actor, request CreateOr
 	if err := validateActor(actor, RoleCustomer); err != nil {
 		return Order{}, err
 	}
+	if request.IdempotencyKey == "" {
+		return Order{}, ErrIdempotencyKeyRequired
+	}
+	if !idempotency.ValidKey(request.IdempotencyKey) {
+		return Order{}, ErrInvalidIdempotencyKey
+	}
 	items, err := normalizeOrderItems(request.Items)
 	if err != nil {
 		return Order{}, err
@@ -171,15 +180,38 @@ func (s *Service) CreateOrder(ctx context.Context, actor Actor, request CreateOr
 	if err != nil {
 		return Order{}, fmt.Errorf("generate order ID: %w", err)
 	}
+	keyHash := idempotency.KeyHash(request.IdempotencyKey)
+	requestHash := orderRequestHash(items)
 
 	operationCtx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
-	created, err := s.repository.CreateOrder(operationCtx, actor.UserID, CreateOrderParams{OrderID: orderID, Items: items})
+	created, err := s.repository.CreateOrder(operationCtx, actor.UserID, CreateOrderParams{
+		OrderID: orderID, Items: items, KeyHash: keyHash[:], RequestHash: requestHash[:],
+	})
 	if err != nil {
 		return Order{}, err
 	}
-	s.logger.InfoContext(ctx, "order created", slog.String("order_id", orderID.String()), slog.String("user_id", actor.UserID.String()))
+	message := "order created"
+	if created.IdempotencyReplay {
+		message = "order creation replayed"
+	}
+	s.logger.InfoContext(
+		ctx, message,
+		slog.String("order_id", created.ID.String()), slog.String("user_id", actor.UserID.String()),
+	)
 	return created, nil
+}
+
+func orderRequestHash(items []RequestedItem) [32]byte {
+	payload := make([]byte, 0, len(items)*32)
+	var encoded [16]byte
+	for _, item := range items {
+		payload = append(payload, item.ProductID[:]...)
+		binary.BigEndian.PutUint64(encoded[:8], uint64(item.Quantity))
+		binary.BigEndian.PutUint64(encoded[8:], uint64(item.ExpectedProductVersion))
+		payload = append(payload, encoded[:]...)
+	}
+	return idempotency.RequestHash(idempotency.OrderCreateOperation, payload)
 }
 
 func (s *Service) ListOrders(ctx context.Context, actor Actor, page PageRequest) (OrderPage, error) {

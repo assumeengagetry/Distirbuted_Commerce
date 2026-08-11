@@ -84,9 +84,6 @@ func consumeJSONValue(decoder *json.Decoder, requireObject bool) error {
 		if requireObject {
 			return errInvalidJSON
 		}
-		if value, ok := token.(string); ok && strings.ContainsRune(value, utf8.RuneError) {
-			return errInvalidJSON
-		}
 		return nil
 	}
 	if requireObject && delimiter != json.Delim('{') {
@@ -166,7 +163,7 @@ func writeDecodeError(c *gin.Context, err error) {
 
 func bearerToken(header string) (string, bool) {
 	scheme, token, ok := strings.Cut(header, " ")
-	if !ok || !strings.EqualFold(scheme, "Bearer") || token == "" || strings.ContainsAny(token, " \t\r\n,") {
+	if !ok || !strings.EqualFold(scheme, "Bearer") || token == "" || !utf8.ValidString(token) || strings.ContainsAny(token, " \t\r\n,") {
 		return "", false
 	}
 	return token, true

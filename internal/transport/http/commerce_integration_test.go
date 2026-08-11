@@ -75,7 +75,7 @@ func TestCommerceAPIIntegration(t *testing.T) {
 	otherCustomerToken := issueIntegrationAccess(t, tokens, otherCustomerID, commerce.RoleCustomer)
 	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
 	service, err := commerce.NewService(
-		database.NewOrderRepository(pool, 2*time.Second, 5*time.Second), logger, 5*time.Second,
+		database.NewOrderRepository(pool, 2*time.Second, 5*time.Second, 2*time.Second), logger, 5*time.Second,
 	)
 	if err != nil {
 		t.Fatalf("commerce.NewService() error = %v", err)
@@ -83,13 +83,13 @@ func TestCommerceAPIIntegration(t *testing.T) {
 	queries := store.New(pool)
 	router, err := NewOrderRouter(OrderDependencies{
 		Logger: logger, ServiceName: "order-service",
-		ReadinessCheck: func(ctx context.Context) error {
+		ReadinessChecks: map[string]func(context.Context) error{"postgres": func(ctx context.Context) error {
 			value, err := queries.OrderHealthCheck(ctx)
 			if err == nil && value != 1 {
 				return fmt.Errorf("order schema is not ready")
 			}
 			return err
-		},
+		}},
 		ReadinessTimeout: 3 * time.Second, CommerceService: service, TokenVerifier: tokens,
 		RateLimit: RateLimitConfig{RequestsPerSecond: 1000, Burst: 100, EntryTTL: time.Minute, MaxEntries: 100},
 		Now:       time.Now,
@@ -135,11 +135,11 @@ func TestCommerceAPIIntegration(t *testing.T) {
 	}, customerToken)
 	assertAPIError(t, deniedAdmin, http.StatusForbidden, "FORBIDDEN")
 
-	createOrder := performJSONRequest(t, router, http.MethodPost, "/v1/orders", map[string]any{
+	createOrder := performJSONRequestWithIdempotency(t, router, http.MethodPost, "/v1/orders", map[string]any{
 		"items": []map[string]any{{
 			"product_id": productID, "quantity": 2, "expected_product_version": 1,
 		}},
-	}, customerToken)
+	}, customerToken, "commerce-order-create-1")
 	if createOrder.Code != http.StatusCreated {
 		t.Fatalf("create order status = %d; body=%s", createOrder.Code, createOrder.Body.String())
 	}
@@ -148,11 +148,11 @@ func TestCommerceAPIIntegration(t *testing.T) {
 		t.Fatalf("created order = %+v", createdOrder)
 	}
 
-	insufficient := performJSONRequest(t, router, http.MethodPost, "/v1/orders", map[string]any{
+	insufficient := performJSONRequestWithIdempotency(t, router, http.MethodPost, "/v1/orders", map[string]any{
 		"items": []map[string]any{{
 			"product_id": productID, "quantity": 1, "expected_product_version": 1,
 		}},
-	}, customerToken)
+	}, customerToken, "commerce-order-create-2")
 	assertAPIError(t, insufficient, http.StatusConflict, "INSUFFICIENT_INVENTORY")
 
 	newPrice := int64(2000)

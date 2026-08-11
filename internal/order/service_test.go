@@ -1,6 +1,7 @@
 package order
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -95,7 +96,7 @@ func TestServiceCreateOrderSortsAndAssignsItemIDs(t *testing.T) {
 	}}
 	service := newOrderTestService(t, repository)
 	actor := Actor{UserID: uuid.New(), Role: RoleCustomer}
-	created, err := service.CreateOrder(t.Context(), actor, CreateOrderRequest{Items: []RequestedItem{
+	created, err := service.CreateOrder(t.Context(), actor, CreateOrderRequest{IdempotencyKey: "sort-order-1", Items: []RequestedItem{
 		{ProductID: second, Quantity: 2, ExpectedProductVersion: 3},
 		{ProductID: first, Quantity: 1, ExpectedProductVersion: 4},
 	}})
@@ -111,6 +112,38 @@ func TestServiceCreateOrderSortsAndAssignsItemIDs(t *testing.T) {
 	if captured.Items[0].ItemID == uuid.Nil || captured.Items[1].ItemID == uuid.Nil ||
 		captured.Items[0].ItemID == captured.Items[1].ItemID {
 		t.Fatalf("item IDs = %s, %s", captured.Items[0].ItemID, captured.Items[1].ItemID)
+	}
+}
+
+func TestServiceCreateOrderCanonicalHashIgnoresInputItemOrder(t *testing.T) {
+	t.Parallel()
+	first := uuid.MustParse("00000000-0000-0000-0000-000000000001")
+	second := uuid.MustParse("ffffffff-ffff-ffff-ffff-ffffffffffff")
+	var captured []CreateOrderParams
+	repository := &stubRepository{createOrder: func(
+		_ context.Context,
+		_ uuid.UUID,
+		params CreateOrderParams,
+	) (Order, error) {
+		captured = append(captured, params)
+		return Order{ID: params.OrderID}, nil
+	}}
+	service := newOrderTestService(t, repository)
+	actor := Actor{UserID: uuid.New(), Role: RoleCustomer}
+	requests := [][]RequestedItem{
+		{{ProductID: first, Quantity: 1, ExpectedProductVersion: 2}, {ProductID: second, Quantity: 3, ExpectedProductVersion: 4}},
+		{{ProductID: second, Quantity: 3, ExpectedProductVersion: 4}, {ProductID: first, Quantity: 1, ExpectedProductVersion: 2}},
+	}
+	for _, items := range requests {
+		if _, err := service.CreateOrder(t.Context(), actor, CreateOrderRequest{
+			Items: items, IdempotencyKey: "canonical-order-key",
+		}); err != nil {
+			t.Fatalf("CreateOrder() error = %v", err)
+		}
+	}
+	if len(captured) != 2 || !bytes.Equal(captured[0].KeyHash, captured[1].KeyHash) ||
+		!bytes.Equal(captured[0].RequestHash, captured[1].RequestHash) {
+		t.Fatalf("canonical order hashes differ: %+v", captured)
 	}
 }
 
@@ -134,10 +167,21 @@ func TestServiceCreateOrderValidation(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if _, err := service.CreateOrder(t.Context(), test.actor, CreateOrderRequest{Items: test.items}); !errors.Is(err, test.want) {
+			if _, err := service.CreateOrder(t.Context(), test.actor, CreateOrderRequest{
+				Items: test.items, IdempotencyKey: "validation-key",
+			}); !errors.Is(err, test.want) {
 				t.Fatalf("CreateOrder() error = %v, want %v", err, test.want)
 			}
 		})
+	}
+	validItems := []RequestedItem{{ProductID: productID, Quantity: 1, ExpectedProductVersion: 1}}
+	if _, err := service.CreateOrder(t.Context(), actor, CreateOrderRequest{Items: validItems}); !errors.Is(err, ErrIdempotencyKeyRequired) {
+		t.Fatalf("CreateOrder(missing key) error = %v, want ErrIdempotencyKeyRequired", err)
+	}
+	if _, err := service.CreateOrder(t.Context(), actor, CreateOrderRequest{
+		Items: validItems, IdempotencyKey: "invalid key",
+	}); !errors.Is(err, ErrInvalidIdempotencyKey) {
+		t.Fatalf("CreateOrder(invalid key) error = %v, want ErrInvalidIdempotencyKey", err)
 	}
 }
 

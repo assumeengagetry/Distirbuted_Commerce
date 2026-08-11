@@ -6,15 +6,22 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"sync/atomic"
 	"syscall"
 	"time"
+
+	"google.golang.org/grpc"
 
 	"github.com/assumeengagetry/distributed-commerce/internal/auth"
 	"github.com/assumeengagetry/distributed-commerce/internal/config"
 	"github.com/assumeengagetry/distributed-commerce/internal/database"
 	store "github.com/assumeengagetry/distributed-commerce/internal/database/sqlc"
+	identityv1 "github.com/assumeengagetry/distributed-commerce/internal/genproto/identity/v1"
 	"github.com/assumeengagetry/distributed-commerce/internal/observability"
+	"github.com/assumeengagetry/distributed-commerce/internal/platform/grpcserver"
 	"github.com/assumeengagetry/distributed-commerce/internal/platform/httpserver"
+	"github.com/assumeengagetry/distributed-commerce/internal/platform/process"
+	grpctransport "github.com/assumeengagetry/distributed-commerce/internal/transport/grpc"
 	httptransport "github.com/assumeengagetry/distributed-commerce/internal/transport/http"
 	"github.com/assumeengagetry/distributed-commerce/internal/user"
 )
@@ -48,6 +55,7 @@ func run() error {
 	defer pool.Close()
 
 	queries := store.New(pool)
+	var grpcListening atomic.Bool
 	readinessCheck := func(ctx context.Context) error {
 		value, err := queries.HealthCheck(ctx)
 		if err != nil {
@@ -96,9 +104,17 @@ func run() error {
 	}
 
 	router, err := httptransport.NewRouter(httptransport.Dependencies{
-		Logger:           logger,
-		ServiceName:      cfg.ServiceName,
-		ReadinessCheck:   readinessCheck,
+		Logger:      logger,
+		ServiceName: cfg.ServiceName,
+		ReadinessChecks: map[string]func(context.Context) error{
+			"postgres": readinessCheck,
+			"identity_grpc": func(context.Context) error {
+				if !grpcListening.Load() {
+					return fmt.Errorf("identity gRPC listener is not ready")
+				}
+				return nil
+			},
+		},
 		ReadinessTimeout: cfg.Database.PingTimeout,
 		UserService:      userService,
 		TokenVerifier:    tokens,
@@ -113,6 +129,19 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("create HTTP router: %w", err)
 	}
-
-	return httpserver.Serve(ctx, cfg.HTTP, logger, router, stop)
+	identityServer, err := grpctransport.NewIdentityServer(tokens, time.Now)
+	if err != nil {
+		return fmt.Errorf("create identity gRPC service: %w", err)
+	}
+	return process.Run(
+		ctx,
+		func(ctx context.Context) error {
+			return httpserver.Serve(ctx, cfg.HTTP, logger, router, stop)
+		},
+		func(ctx context.Context) error {
+			return grpcserver.Serve(ctx, cfg.GRPC, logger, func(registrar grpc.ServiceRegistrar) {
+				identityv1.RegisterIdentityServiceServer(registrar, identityServer)
+			}, func() { grpcListening.Store(true) }, func() { grpcListening.Store(false) })
+		},
+	)
 }

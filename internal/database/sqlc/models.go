@@ -12,12 +12,24 @@ import (
 )
 
 type Account struct {
-	ID        uuid.UUID `json:"id"`
-	UserID    uuid.UUID `json:"user_id"`
-	Currency  string    `json:"currency"`
-	Balance   int64     `json:"balance"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID             uuid.UUID `json:"id"`
+	UserID         uuid.UUID `json:"user_id"`
+	Currency       string    `json:"currency"`
+	Balance        int64     `json:"balance"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
+	BalanceVersion int64     `json:"balance_version"`
+}
+
+type AccountBalanceEntry struct {
+	AccountID      uuid.UUID `json:"account_id"`
+	UserID         uuid.UUID `json:"user_id"`
+	Currency       string    `json:"currency"`
+	BalanceVersion int64     `json:"balance_version"`
+	BalanceBefore  int64     `json:"balance_before"`
+	BalanceAfter   int64     `json:"balance_after"`
+	DebitAmount    int64     `json:"debit_amount"`
+	CreatedAt      time.Time `json:"created_at"`
 }
 
 type AuthSession struct {
@@ -27,6 +39,18 @@ type AuthSession struct {
 	RevokedAt pgtype.Timestamptz `json:"revoked_at"`
 	CreatedAt time.Time          `json:"created_at"`
 	UpdatedAt time.Time          `json:"updated_at"`
+}
+
+type IdempotencyKey struct {
+	ActorID        uuid.UUID          `json:"actor_id"`
+	Operation      string             `json:"operation"`
+	KeyHash        []byte             `json:"key_hash"`
+	RequestHash    []byte             `json:"request_hash"`
+	ResourceID     uuid.UUID          `json:"resource_id"`
+	State          string             `json:"state"`
+	ResponseStatus pgtype.Int2        `json:"response_status"`
+	CreatedAt      time.Time          `json:"created_at"`
+	CompletedAt    pgtype.Timestamptz `json:"completed_at"`
 }
 
 type Inventory struct {
@@ -58,6 +82,20 @@ type OrderItem struct {
 	UnitPriceAmount int64     `json:"unit_price_amount"`
 	LineAmount      int64     `json:"line_amount"`
 	CreatedAt       time.Time `json:"created_at"`
+}
+
+type Payment struct {
+	ID                    uuid.UUID `json:"id"`
+	OrderID               uuid.UUID `json:"order_id"`
+	UserID                uuid.UUID `json:"user_id"`
+	AccountID             uuid.UUID `json:"account_id"`
+	AccountBalanceVersion int64     `json:"account_balance_version"`
+	Status                string    `json:"status"`
+	Currency              string    `json:"currency"`
+	Amount                int64     `json:"amount"`
+	BalanceBefore         int64     `json:"balance_before"`
+	BalanceAfter          int64     `json:"balance_after"`
+	CreatedAt             time.Time `json:"created_at"`
 }
 
 type Product struct {

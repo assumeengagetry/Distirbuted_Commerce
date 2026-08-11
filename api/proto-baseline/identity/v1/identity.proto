@@ -1,0 +1,25 @@
+syntax = "proto3";
+
+package identity.v1;
+
+option go_package = "github.com/assumeengagetry/distributed-commerce/internal/genproto/identity/v1;identityv1";
+
+service IdentityService {
+  rpc ValidateAccessToken(ValidateAccessTokenRequest) returns (ValidateAccessTokenResponse);
+}
+
+message ValidateAccessTokenRequest {
+  string access_token = 1;
+}
+
+message ValidateAccessTokenResponse {
+  string user_id = 1;
+  PrincipalRole role = 2;
+  string token_id = 3;
+}
+
+enum PrincipalRole {
+  PRINCIPAL_ROLE_UNSPECIFIED = 0;
+  PRINCIPAL_ROLE_CUSTOMER = 1;
+  PRINCIPAL_ROLE_ADMIN = 2;
+}

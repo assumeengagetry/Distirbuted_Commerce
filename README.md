@@ -1,8 +1,8 @@
 # Distributed Commerce Platform
 
-A production-oriented Go microservice portfolio project built incrementally around transactional commerce workflows. The repository currently implements **Phase 3**: the service foundation, user authentication, product administration, inventory control, transactional order creation, customer/admin order history, and real PostgreSQL concurrency tests.
+A production-oriented Go microservice portfolio project built incrementally around transactional commerce workflows. The repository currently implements **Phase 5**: the service foundation, user authentication, catalog/inventory, idempotent orders/payments, and deadline-bound protobuf/gRPC identity communication.
 
-Payments, order state transitions, idempotency, gRPC, Redis application integration, asynchronous jobs, metrics, and tracing are intentionally not claimed as implemented yet.
+External payment providers, refunds, cancellation/restock workflows, Redis application integration, asynchronous jobs, metrics, and tracing are intentionally not claimed as implemented yet.
 
 ## Current Status
 
@@ -21,13 +21,22 @@ Implemented:
 - Transactional refresh rotation, concurrent-use protection, replay detection, and session-family revocation
 - Bearer authentication and centralized role authorization middleware
 - Request IDs, strict JSON decoding, 16 KiB body limits, and bounded per-IP auth rate limiting
-- A separate `order-service` process that validates user-service PASETO access tokens
+- A separate `order-service` process that validates access tokens through user-service gRPC
 - Versioned product administration and active-only public catalog reads
 - Atomic, versioned inventory adjustments without blind absolute overwrites
 - Transactional multi-item order creation with deterministic locking and immutable product/price snapshots
 - Customer-owned order history plus current-admin access to all orders
 - Opaque keyset pagination for products, inventory, and orders
 - Bounded commerce rate limiting by direct client IP or authenticated principal
+- Mandatory request-hashed `Idempotency-Key` handling for order and payment creation
+- A separate `payment-service` process with owned-payment reads and current-admin reads
+- Atomic account debit, succeeded payment insert, and `pending -> paid` order transition
+- Commit-outcome resolution that never automatically reruns an ambiguous debit
+- Versioned `identity.v1` protobuf contract with generated Go and gRPC stubs
+- Deadline-bound identity gRPC client with no configured retries and sanitized `401`/`503` mapping
+- User-service HTTP and gRPC dual-listener lifecycle with standard gRPC health and bounded drain
+- Loopback-only local gRPC plus production TLS 1.3 mTLS and SPIFFE URI client allowlisting
+- PASETO key isolation: only user-service can load the symmetric key
 - Loopback-only local HTTP and mandatory TLS 1.3 certificate configuration in production
 - PostgreSQL-backed readiness, process liveness, and signal-aware graceful shutdown
 - Rootless PostgreSQL and Redis infrastructure using Podman Quadlet and systemd user units
@@ -39,16 +48,25 @@ Implemented:
 flowchart LR
     Client[HTTP Client] --> UserHTTP[User HTTP :8081]
     Client --> OrderHTTP[Order HTTP :8082]
+    Client --> PaymentHTTP[Payment HTTP :8083]
     UserHTTP --> UserMiddleware[Request ID / Auth Rate Limit]
-    OrderHTTP --> OrderMiddleware[Request ID / PASETO / Role / Rate Limit]
+    OrderHTTP --> OrderMiddleware[Request ID / gRPC Auth / Role / Rate Limit]
+    PaymentHTTP --> PaymentMiddleware[Request ID / gRPC Auth / Role / Rate Limit]
+    OrderMiddleware --> IdentityClient[Identity gRPC Client]
+    PaymentMiddleware --> IdentityClient
+    IdentityClient --> UserGRPC[User gRPC :9091]
+    UserGRPC --> Tokens[PASETO v4.local]
     UserMiddleware --> UserService[User Service]
     OrderMiddleware --> OrderService[Order Service]
+    PaymentMiddleware --> PaymentService[Payment Service]
     UserService --> Passwords[Argon2id]
-    UserService --> Tokens[PASETO v4.local]
+    UserService --> Tokens
     UserService --> UserRepository[User Repository]
     OrderService --> OrderRepository[Order Repository]
+    PaymentService --> PaymentRepository[Payment Repository]
     UserRepository --> SQLC[sqlc Queries]
     OrderRepository --> SQLC
+    PaymentRepository --> SQLC
     SQLC --> PostgreSQL[(PostgreSQL)]
     Migrations[golang-migrate] --> PostgreSQL
     Redis[(Redis)]:::future
@@ -62,7 +80,7 @@ The dependency direction is:
 Gin transport -> domain service -> repository interface <- PostgreSQL implementation
 ```
 
-Gin never enters a service or repository API. The user and order processes share the local PostgreSQL database and PASETO key but own separate composition roots, HTTP routes, readiness contracts, and domain packages. Redis runs as infrastructure but remains outside application behavior until Phase 6. PostgreSQL is the source of truth.
+Gin and gRPC remain transport adapters around typed boundaries. The three processes share PostgreSQL for the Phase 4 monetary transaction, but only user-service receives the PASETO key. Order/payment authenticate through user-service before entering domain code, then recheck current role/status in PostgreSQL. No RPC occurs inside a database transaction. Redis remains outside application behavior until Phase 6.
 
 ## Project Layout
 
@@ -70,19 +88,28 @@ Gin never enters a service or repository API. The user and order processes share
 .
 ├── cmd/user-service/          # User/auth process composition
 ├── cmd/order-service/         # Product/inventory/order process composition
+├── cmd/payment-service/       # Account debit/payment process composition
 ├── internal/auth/             # Argon2id, PASETO, refresh tokens, principal context
 ├── internal/user/             # Models, business rules, service, repository boundary
 ├── internal/order/            # Catalog, inventory, order rules and repository boundary
+├── internal/payment/          # Payment rules and repository boundary
+├── internal/idempotency/      # Key validation and canonical request hashing
+├── internal/identity/         # Deadline-bound identity gRPC client
+├── internal/genproto/         # Committed generated protobuf/gRPC Go code
 ├── internal/config/           # Environment parsing and validation
 ├── internal/database/         # pgx pool, PostgreSQL repository, generated sqlc
 ├── internal/observability/    # slog construction
-├── internal/platform/         # Shared HTTP TLS and graceful server lifecycle
+├── internal/platform/         # HTTP/gRPC lifecycle and graceful process orchestration
+├── internal/transport/grpc/   # Handwritten identity gRPC adapter
 ├── internal/transport/http/   # Gin handlers and middleware
+├── api/proto/identity/v1/     # Versioned identity service contract
 ├── db/migrations/             # Ordered up/down migrations
 ├── db/query/                  # Reviewed SQL consumed by sqlc
 ├── deploy/quadlet/            # Rootless Podman systemd units
-├── scripts/                   # Local secret initialization
+├── scripts/                   # Local secrets, generated-code checks, test DB safety
 ├── Makefile
+├── buf.yaml
+├── buf.gen.yaml
 └── sqlc.yaml
 ```
 
@@ -92,6 +119,8 @@ Gin never enters a service or repository API. The user and order processes share
 | --- | --- |
 | Language | Go 1.26.5 |
 | HTTP | Gin 1.12 |
+| RPC | gRPC-Go 1.83 |
+| Contracts | Protocol Buffers 3, Buf 1.72 |
 | Access tokens | PASETO v4.local |
 | Password hashing | Argon2id |
 | Database | PostgreSQL 17 |
@@ -119,11 +148,13 @@ Gin never enters a service or repository API. The user and order processes share
 | Order `:8082` | `PATCH` | `/v1/admin/products/:product_id` | Current admin | Version-checked product update |
 | Order `:8082` | `GET` | `/v1/admin/inventory` | Current admin | List exact inventory quantities |
 | Order `:8082` | `PATCH` | `/v1/admin/inventory/:product_id` | Current admin | Version-checked additive inventory adjustment |
-| Order `:8082` | `POST` | `/v1/orders` | Current customer | Atomically create a pending order and deduct stock |
+| Order `:8082` | `POST` | `/v1/orders` | Current customer + idempotency key | Atomically create a pending order and deduct stock |
 | Order `:8082` | `GET` | `/v1/orders` | Current customer/admin | Customer's orders or all orders for admins |
 | Order `:8082` | `GET` | `/v1/orders/:order_id` | Current customer/admin | Owned order or any order for admins |
-| Both | `GET` | `/healthz` | Public | Process liveness |
-| Both | `GET` | `/readyz` | Public | Service-specific PostgreSQL/schema readiness |
+| Payment `:8083` | `POST` | `/v1/payments` | Current customer + idempotency key | Debit account, record payment, and mark order paid |
+| Payment `:8083` | `GET` | `/v1/payments/:payment_id` | Current customer/admin | Owned payment or any payment for admins |
+| All | `GET` | `/healthz` | Public | Process liveness |
+| All | `GET` | `/readyz` | Public | Service-specific PostgreSQL/schema readiness |
 
 Register:
 
@@ -148,8 +179,20 @@ Create an order after obtaining a product and its current `version`:
 curl --fail-with-body \
   -H 'Content-Type: application/json' \
   -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+  -H "Idempotency-Key: ${ORDER_IDEMPOTENCY_KEY}" \
   -d '{"items":[{"product_id":"'"${PRODUCT_ID}"'","quantity":1,"expected_product_version":1}]}' \
   http://127.0.0.1:8082/v1/orders
+```
+
+Pay a pending order from the customer's internal account balance:
+
+```bash
+curl --fail-with-body \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+  -H "Idempotency-Key: ${PAYMENT_IDEMPOTENCY_KEY}" \
+  -d '{"order_id":"'"${ORDER_ID}"'"}' \
+  http://127.0.0.1:8083/v1/payments
 ```
 
 Errors use one transport-owned envelope and never expose pgx, sqlc, Argon2id, or token parser details:
@@ -164,9 +207,20 @@ Errors use one transport-owned envelope and never expose pgx, sqlc, Argon2id, or
 }
 ```
 
+## gRPC Contract
+
+User-service listens on `127.0.0.1:9091` locally and implements `identity.v1.IdentityService`:
+
+| Method | Caller | Purpose | Failure contract |
+| --- | --- | --- | --- |
+| `ValidateAccessToken` | order/payment | Return canonical user UUID, token UUID, and enum role | Invalid token is `UNAUTHENTICATED`; dependency/protocol failures fail closed as HTTP `503` |
+| `grpc.health.v1.Health/Check` | order/payment readiness | Report identity RPC serving state | Non-serving/unavailable marks only `identity_grpc` down |
+
+The client derives a one-second deadline from the HTTP request context, preserves shorter parent deadlines, caps messages/metadata, and disables configured gRPC retries. The RPC finishes before domain/repository execution. Server requests also receive a two-second upper bound. Generated files are committed under `internal/genproto`; pinned generation is compared byte-for-byte, and Buf breaking checks against the human-readable `api/proto-baseline` contract.
+
 ## Database Schema
 
-The first three migrations create eight related business tables:
+The first four migrations create eleven related business tables:
 
 ```mermaid
 erDiagram
@@ -177,6 +231,12 @@ erDiagram
     PRODUCTS ||--|| INVENTORIES : stocks
     PRODUCTS ||--o{ ORDER_ITEMS : snapshots
     ORDERS ||--|{ ORDER_ITEMS : contains
+    USERS ||--o{ IDEMPOTENCY_KEYS : owns
+    USERS ||--o{ PAYMENTS : makes
+    ACCOUNTS ||--o{ PAYMENTS : funds
+    ACCOUNTS ||--o{ ACCOUNT_BALANCE_ENTRIES : records
+    ACCOUNT_BALANCE_ENTRIES ||--o| PAYMENTS : proves_debit
+    ORDERS ||--o| PAYMENTS : settles
 
     USERS {
         uuid id PK
@@ -190,6 +250,7 @@ erDiagram
         uuid user_id UK
         varchar currency
         bigint balance
+        bigint balance_version
     }
     AUTH_SESSIONS {
         uuid id PK
@@ -230,9 +291,35 @@ erDiagram
         bigint quantity
         bigint line_amount
     }
+    IDEMPOTENCY_KEYS {
+        uuid actor_id PK
+        varchar operation PK
+        bytea key_hash PK
+        bytea request_hash
+        uuid resource_id
+        varchar state
+    }
+    ACCOUNT_BALANCE_ENTRIES {
+        uuid account_id PK
+        bigint balance_version PK
+        bigint balance_before
+        bigint balance_after
+        bigint debit_amount
+    }
+    PAYMENTS {
+        uuid id PK
+        uuid order_id UK
+        uuid user_id FK
+        uuid account_id FK
+        bigint account_balance_version FK
+        bigint amount
+        bigint balance_before
+        bigint balance_after
+        varchar status
+    }
 ```
 
-Database constraints additionally enforce canonical unique SKUs, bounded positive minor-unit prices, non-negative bounded inventory, valid product/order statuses, unique products per order, and exact `line_amount = unit_price_amount * quantity` using overflow-safe numeric comparison.
+Database constraints additionally enforce canonical unique SKUs, bounded positive minor-unit prices, non-negative inventory/accounts, valid product/order/payment statuses, one payment per order, same-user/currency/amount payment links, exact line totals, and exact `balance_before - amount = balance_after` using overflow-safe numeric comparison. Account balance triggers increment `balance_version` and record every real before/after transition. Each payment uniquely references the matching debit entry, while deferred checks require the order to be paid and the account to equal `balance_after` at commit. Payments are immutable and paid order status is terminal.
 
 ## Registration Transaction
 
@@ -258,6 +345,7 @@ Order requests contain 1 to 50 unique products, each with quantity 1 to 1000 and
 ```text
 BEGIN
   verify the current user is an active customer and read account currency
+  reserve order idempotency digest and canonical request hash
   SELECT each product in UUID order FOR SHARE
   verify active status, version, currency, and calculate checked totals
   UPDATE each inventory row in UUID order
@@ -265,10 +353,41 @@ BEGIN
     WHERE quantity >= requested
   INSERT pending order
   INSERT immutable order-item SKU/name/version/price snapshots
+  mark idempotency record completed
 COMMIT
 ```
 
 Every lock and statement has a PostgreSQL timeout, and the whole operation has a request-level database deadline. Missing stock, a stale product version, currency mismatch, timeout, or any later insert failure rolls back every earlier deduction. The public catalog exposes only `in_stock`/`out_of_stock`; exact quantities remain admin-only and advisory reads never replace transactional checks.
+
+## Payment And Idempotency Transactions
+
+`POST /v1/orders` and `POST /v1/payments` require exactly one `Idempotency-Key`. Only a SHA-256 key digest is stored. The canonical order request hash covers sorted product IDs, quantities, and expected versions; the payment hash covers the order ID. JSON whitespace and item input order therefore do not alter request identity.
+
+Same actor, operation, key, and request returns the original resource and `Idempotency-Replayed: true`. Reusing a key for a different request returns `409`. Reservations commit in the same transaction as their side effects, so ordinary business failures leave no stale reservation.
+Completed keys are retained with their business records. Phase 4 does not expire them automatically because deleting a key could make an old request executable again.
+
+Payment uses this lock order:
+
+```text
+BEGIN
+  SELECT active customer FOR SHARE
+  reserve payment idempotency digest and request hash
+  SELECT owned order FOR UPDATE
+  require order status = pending
+  SELECT customer account FOR UPDATE
+  require matching currency and sufficient BIGINT balance
+  conditionally debit account
+    trigger increments balance_version and records the balance transition
+  INSERT succeeded payment with before/after balance snapshot
+    require a unique matching debit entry
+  UPDATE order pending -> paid
+  mark idempotency record completed
+COMMIT
+```
+
+Different payment keys for one order serialize on the order row; only one debit can commit. Payments for different orders serialize on the shared account row and cannot overdraw it. Insufficient funds creates no payment, leaves the order pending, and permits the same key to be retried after funding.
+
+If a commit response is lost, the service uses a short independent deadline to resolve the completed idempotency record. A confirmed record returns the committed resource. An unresolved outcome returns `503 OPERATION_OUTCOME_UNKNOWN` and requires the client to retry the same key/body; the service never automatically reruns the mutation.
 
 ## Authentication Design
 
@@ -292,7 +411,7 @@ Access tokens are encrypted and authenticated PASETO v4.local tokens. Validation
 - a UUID subject and token ID
 - bounded lifetime and configured clock skew
 
-The symmetric 32-byte key is generated under `.secrets/` for local development and injected only into the service process environment.
+The symmetric 32-byte key is generated under `.secrets/` for local development and injected only into user-service. User HTTP validates locally; order/payment send the bearer value over the identity gRPC channel and receive only UUID/role principal fields. Their configuration rejects a nonempty `PASETO_V4_LOCAL_KEY`.
 
 ### Refresh Rotation
 
@@ -317,7 +436,7 @@ Refresh rotation does not extend the session's absolute expiry. Request-level da
 
 ## Authorization
 
-Users have `customer` or `admin` roles. Self-registration always creates a `customer`; request payloads cannot select a role. Authentication puts a typed principal in `context.Context`, and role checks use centralized middleware rather than handler conditionals. Product/inventory mutations, order creation, and admin order reads also recheck the current database role/status instead of trusting only a possibly stale access-token role.
+Users have `customer` or `admin` roles. Self-registration always creates a `customer`; request payloads cannot select a role. Local or gRPC authentication puts the same typed principal in `context.Context`, and role checks use centralized middleware. Product/inventory mutations, orders, and payments still recheck current database role/status instead of trusting a possibly stale token role.
 
 ## Health Contract
 
@@ -327,10 +446,10 @@ Users have `customer` or `admin` roles. Self-registration always creates a `cust
 {"status":"ok","service":"user-service"}
 ```
 
-`GET /readyz` runs a deadline-bound sqlc query. User-service verifies the Phase 2 tables; order-service independently verifies products, inventories, orders, and order items. Database or schema failure returns `503` without exposing the driver error:
+`GET /readyz` runs dependency checks concurrently under one deadline. User-service verifies PostgreSQL plus its gRPC listener. Order/payment report PostgreSQL and `identity_grpc` independently; payment also verifies ledger constraints and settlement functions. A dependency failure returns `503` without exposing driver or TLS details:
 
 ```json
-{"status":"not_ready","service":"user-service","checks":{"postgres":"down"}}
+{"status":"not_ready","service":"order-service","checks":{"identity_grpc":"down","postgres":"up"}}
 ```
 
 ## Local Development
@@ -338,8 +457,8 @@ Users have `customer` or `admin` roles. Self-registration always creates a `cust
 ### Prerequisites
 
 - Go 1.26.5 or newer
-- sqlc 1.31 or newer
 - Podman 5.7 or newer with Quadlet support
+- PostgreSQL client tools (`psql`, `createdb`, and `dropdb`)
 - OpenSSL
 - A working systemd user session
 
@@ -360,11 +479,17 @@ In another terminal:
 make run-order
 ```
 
-`make init` creates `.env`, PostgreSQL/Redis credentials, a Redis ACL file, and a random PASETO key under `.secrets/`, all with owner-only permissions. These paths are ignored by Git. Rerunning it preserves existing random credentials and normalizes permissions.
+In a third terminal:
 
-`make infra-up` installs the Quadlets and waits for PostgreSQL and Redis health checks. Rootless `pasta` networking publishes ports only on loopback. User-service defaults to `127.0.0.1:8081`; `make run-order` overrides the second process to `127.0.0.1:8082`. Production mode refuses to start without a TLS certificate/key pair and serves TLS 1.3 directly.
+```bash
+make run-payment
+```
 
-The first migration command builds pinned `golang-migrate` `v4.18.3` into the ignored `bin/` directory. The Go toolchain honors the configured `GOPROXY`.
+`make init` creates `.env`, PostgreSQL/Redis credentials, a Redis ACL file, and a random PASETO key under `.secrets/`, all with owner-only permissions. These paths are ignored by Git. Rerunning it preserves existing random credentials and normalizes their permissions.
+
+`make infra-up` installs the Quadlets, waits for PostgreSQL/Redis, and creates the isolated database named by `TEST_DATABASE_URL` when absent. Rootless `pasta` publishes infrastructure only on loopback. User, order, and payment HTTP default to `127.0.0.1:8081`, `:8082`, and `:8083`; user-service also binds identity gRPC on `127.0.0.1:9091`. Start user-service first. Local plaintext HTTP/gRPC is accepted only on loopback.
+
+The tool targets build pinned `golang-migrate`, sqlc, Buf, protobuf generators, and govulncheck into the ignored `bin/` directory. The Go toolchain honors the configured `GOPROXY`.
 
 Stop local infrastructure:
 
@@ -377,16 +502,28 @@ make infra-down
 | Variable | Required | Default | Purpose |
 | --- | --- | --- | --- |
 | `DATABASE_URL` | yes | none | PostgreSQL connection URL |
-| `PASETO_V4_LOCAL_KEY` | yes | none | 32-byte hex v4.local key; injected by `make run-user` and `make run-order` |
+| `TEST_DATABASE_URL` | integration only | none | Disposable non-production database; its PostgreSQL system identifier/database OID must differ from `DATABASE_URL` |
+| `PASETO_V4_LOCAL_KEY` | user only | none | 32-byte v4.local key; rejected by order/payment |
 | `APP_ENV` | no | `local` | `local`, `test`, or `production` |
 | `SERVICE_NAME` | no | process-specific | Structured log and health response service name |
-| `HTTP_ADDR` | no | user `:8081`, order `:8082` | Process-specific loopback listen address |
-| `HTTP_TLS_CERT_FILE` | production | none | PEM certificate chain for native HTTPS |
+| `HTTP_ADDR` | no | user `:8081`, order `:8082`, payment `:8083` | Process-specific loopback listen address |
+| `HTTP_TLS_CERT_FILE` | production | none | PEM certificate chain for native HTTPS; plaintext is loopback-only |
 | `HTTP_TLS_KEY_FILE` | production | none | PEM private key for native HTTPS |
+| `GRPC_ADDR` | user only | `127.0.0.1:9091` | Identity gRPC listen address |
+| `IDENTITY_GRPC_TARGET` | order/payment | `127.0.0.1:9091` | User-service identity target |
+| `GRPC_CALL_TIMEOUT` | no | `1s` | Identity client per-call upper bound |
+| `GRPC_REQUEST_TIMEOUT` | no | `2s` | Identity server unary request upper bound |
+| `GRPC_SHUTDOWN_TIMEOUT` | no | `10s` | Bounded gRPC graceful drain |
+| `GRPC_TLS_CERT_FILE` | production | none | Process certificate for gRPC mTLS |
+| `GRPC_TLS_KEY_FILE` | production | none | Process private key for gRPC mTLS |
+| `GRPC_TLS_CA_FILE` | production | none | Internal CA used to verify the peer |
+| `GRPC_TLS_SERVER_NAME` | order/payment production | none | Identity server DNS SAN to verify |
+| `GRPC_TLS_ALLOWED_CLIENT_URIS` | user production | none | Comma-separated allowed order/payment SPIFFE URI SANs |
 | `ACCESS_TOKEN_TTL` | no | `15m` | Access-token lifetime |
 | `REFRESH_TOKEN_TTL` | no | `168h` | Absolute session/refresh lifetime |
 | `TOKEN_CLOCK_SKEW` | no | `30s` | Maximum accepted clock skew |
 | `REFRESH_REUSE_GRACE` | no | `5s` | Concurrent refresh retry grace |
+| `TOKEN_ISSUER` | user only | `distributed-commerce/user-service` | Exact PASETO issuer |
 | `ARGON2_MEMORY_KIB` | no | `65536` | Argon2id memory cost |
 | `ARGON2_ITERATIONS` | no | `3` | Argon2id time cost |
 | `ARGON2_MAX_CONCURRENCY` | no | `2` | Process-wide concurrent Argon2id limit |
@@ -394,12 +531,24 @@ make infra-down
 | `AUTH_RATE_LIMIT_BURST` | no | `5` | Auth token-bucket burst |
 | `COMMERCE_RATE_LIMIT_RPS` | no | `20` | Catalog requests per IP or authenticated requests per principal per second |
 | `COMMERCE_RATE_LIMIT_BURST` | no | `40` | Commerce token-bucket burst |
+| `PAYMENT_RATE_LIMIT_RPS` | no | `10` | Payment requests per second per IP/principal |
+| `PAYMENT_RATE_LIMIT_BURST` | no | `20` | Payment token-bucket burst |
 | `DB_MAX_CONNS` | no | `20` | pgx pool upper bound |
 | `DB_MIN_IDLE_CONNS` | no | `2` | pgx idle connection lower bound |
 | `DB_OPERATION_TIMEOUT` | no | `5s` | Maximum application database operation time |
 | `DB_LOCK_TIMEOUT` | no | `2s` | PostgreSQL transaction lock wait limit |
+| `DB_COMMIT_RESOLUTION_TIMEOUT` | no | `2s` | Independent ambiguous-commit resolution budget |
+| `ORDER_HTTP_ADDR` | make target only | `127.0.0.1:8082` | `make run-order` listen override |
+| `PAYMENT_HTTP_ADDR` | make target only | `127.0.0.1:8083` | `make run-payment` listen override |
 
-All accepted ranges are checked before the service opens its listener. Production requires `sslmode=verify-full` in `DATABASE_URL`.
+Each process parses only settings it owns: auth for user, commerce limits for order, and payment limits for payment. Common request budgets ensure gRPC authentication plus database work and ambiguous-commit resolution leave response time inside `HTTP_WRITE_TIMEOUT`. Production requires PostgreSQL `sslmode=verify-full`, native HTTPS, and gRPC mTLS. The order/payment Make targets need only `pgpass`, explicitly unset the PASETO key, and use `ORDER_HTTP_ADDR`/`PAYMENT_HTTP_ADDR`.
+
+### Phase 5 Rollout
+
+1. Provision a dedicated internal gRPC CA, a user-service server certificate with the configured DNS SAN, and client certificates whose SPIFFE URI SANs match `GRPC_TLS_ALLOWED_CLIENT_URIS`.
+2. Deploy user-service first with HTTP TLS, `GRPC_ADDR`, its PASETO key, server certificate/key, CA, and client URI allowlist. Verify both `:8081/readyz` checks and standard gRPC health.
+3. Remove `PASETO_V4_LOCAL_KEY` from order/payment environments, configure their client certificate/key, CA, server name, and identity target, then deploy them independently. Do not send traffic until each `/readyz` reports both dependencies up and an authenticated request succeeds through gRPC.
+4. During rollback, keep Phase 5 user-service/gRPC available. A Phase 4 order/payment binary requires temporarily restoring the PASETO key; a Phase 5 consumer intentionally refuses to start while that key is present.
 
 ## Testing
 
@@ -408,7 +557,10 @@ make test
 make test-race
 make test-integration
 make check
+make release-check
 ```
+
+`make test-integration` forcibly drops and recreates `TEST_DATABASE_URL`. Before any drop, the safety gate verifies that its PostgreSQL system identifier and database OID differ from `DATABASE_URL`, and it refuses to run when normalized `APP_ENV` is `production`. Never point `TEST_DATABASE_URL` at data that must be retained.
 
 Coverage includes:
 
@@ -425,6 +577,17 @@ Coverage includes:
 - A barrier-synchronized `N=20`, stock `1` overselling test that requires exactly one order and a final quantity of zero
 - Opposing `[A,B]`/`[B,A]` concurrent orders and equal-timestamp multipage keyset tests
 - Full admin-create/public-read/customer-order/history/restock API flow against real PostgreSQL and PASETO
+- Twenty-way same-key order/payment concurrency with one side effect and identical resource IDs
+- Same-key/different-request conflicts and failed-operation reservation rollback
+- Concurrent same-order payments, different-order account contention, and nonnegative final balances
+- Database-enforced payment-to-debit-entry linkage, immutable payments, and terminal paid status
+- Late payment insert failure rollback after debit and synthetic commit-acknowledgement loss recovery
+- Full pending-order -> account debit -> payment -> paid-order HTTP flow with byte-identical replays
+- Identity protobuf server/client behavior, deadlines, cancellation, malformed principals, health, and outage-to-HTTP mapping
+- Real TLS 1.3 mTLS handshakes for allowed/unlisted SPIFFE clients and server-name mismatch
+- gRPC-backed order/payment HTTP integration plus listener outage/recovery smoke
+- Pinned protobuf/sqlc generation, module tidiness, race/vet/build checks, and reachable-vulnerability scanning
+- Empty-database migration up/down/up validation and serialized cross-package PostgreSQL integration tests
 
 CI and benchmark reporting are Phase 8 work. No performance data is invented.
 
@@ -435,23 +598,33 @@ CI and benchmark reporting are Phase 8 work. No performance data is invented.
 - **Database concurrency control:** refresh serialization uses PostgreSQL row locks, not a Go mutex, so it works across replicas.
 - **Deterministic order locking:** product and inventory rows are acquired in sorted UUID order; atomic conditional updates are the final overselling guard.
 - **Immutable order history:** names, SKUs, versions, unit prices, and line totals are copied into order items while product rows are locked.
-- **Separate composition roots:** user and order APIs run as distinct processes while sharing narrowly scoped platform/auth/database packages.
+- **Separate composition roots:** user, order, and payment APIs run as distinct processes while sharing narrowly scoped platform/auth/database packages.
+- **Database-backed idempotency:** successful keys, request hashes, and resource IDs commit atomically with mutations; raw keys are not stored.
+- **Order-before-account payment locks:** same-order races resolve before account debit, while account locks prevent cross-order overdrafts.
 - **No network calls in transactions:** password hashing and external operations remain outside database transactions.
+- **Centralized token authority:** only user-service decrypts PASETO; consumers use a narrow read-only identity RPC before domain work.
+- **Fail-closed identity dependency:** invalid tokens are `401`; an unavailable or malformed identity response is `503`, never anonymous access.
+- **Deadline composition:** gRPC, database, commit-resolution, and response margin are validated as one HTTP budget.
 - **Small interfaces at consumers:** the service owns its repository boundary; transport owns its service/token boundaries for focused tests.
 - **No global mutable state:** configuration, keys, logger, pool, limiter, and services are constructed in `main`.
 - **Strict transport boundary:** Gin parses HTTP and maps errors; business rules receive `context.Context` and domain requests.
-- **Redis is not authoritative:** it is provisioned but unused by Phase 3 application code.
+- **Redis is not authoritative:** it is provisioned but unused by Phase 5 application code.
 
 ## Security Baseline
 
 - `.env`, `.secrets/`, and generated binaries are excluded from Git.
-- Database, Redis, and HTTP development ports bind to local configuration; infrastructure ports bind loopback.
+- Database, Redis, HTTP, and gRPC plaintext development ports bind only to loopback.
 - Passwords, bearer tokens, refresh tokens, and DSNs are never written to business logs.
 - Refresh-token digests are compared in constant time.
 - JSON rejects unknown fields, duplicate keys, and trailing values; request bodies are capped at 16 KiB.
 - Gin does not trust forwarding proxies by default.
 - Auth endpoints use a bounded LRU per-IP token bucket, an overflow bucket at capacity, and IPv6 `/64` aggregation.
-- Commerce endpoints use the same bounded design, keyed by direct IP before authentication and principal UUID afterward.
+- Commerce and payment endpoints use the same bounded design, keyed by direct IP before authentication and principal UUID afterward.
+- Idempotency keys are validated, hashed before persistence, and never logged.
+- Bearer values are never logged by gRPC adapters; dependency diagnostics contain target/code/cause only.
+- Production identity RPC uses TLS 1.3 mTLS plus an exact SPIFFE URI client allowlist.
+- gRPC limits request/response/metadata sizes, concurrent streams, server execution time, and graceful drain time.
+- `release-check` runs govulncheck and fails on vulnerabilities reachable through application call paths.
 - Logout and confirmed replay revocation use short independent deadlines so client cancellation cannot undo the security action.
 - Database parse errors and HTTP errors are sanitized.
 - Graceful shutdown restores default signal handling after the first termination signal.
@@ -461,8 +634,8 @@ CI and benchmark reporting are Phase 8 work. No performance data is invented.
 1. **Phase 1 complete:** runtime, PostgreSQL, migration, sqlc, logging, probes, Podman Quadlet.
 2. **Phase 2 complete:** users, accounts, Argon2id, PASETO, refresh rotation, auth middleware, API/integration tests.
 3. **Phase 3 complete:** products, inventory, transactional order creation/history, and overselling concurrency tests.
-4. **Phase 4:** account debit, payment transactions, order state changes, and idempotency.
-5. **Phase 5:** protobuf contracts and deadline-bound gRPC communication.
+4. **Phase 4 complete:** account debit, payment transactions, paid-order transition, and order/payment idempotency.
+5. **Phase 5 complete:** versioned identity protobuf, deadline-bound gRPC auth, mTLS, health, and coordinated lifecycle.
 6. **Phase 6:** Redis product cache, Asynq jobs, retries, and failed task handling.
 7. **Phase 7:** Prometheus metrics and OpenTelemetry traces.
 8. **Phase 8:** production images, Kubernetes, OpenAPI, CI, benchmarks, and final portfolio documentation.
@@ -471,11 +644,12 @@ CI and benchmark reporting are Phase 8 work. No performance data is invented.
 
 - Stateless access tokens cannot be individually revoked; exposure is bounded by the access-token TTL.
 - Role/status changes can remain visible in an existing access token until it expires; refresh reads current database state.
-- Auth and commerce rate limiters are process-local. Distributed enforcement belongs at ingress or in a later Redis-backed implementation.
-- Order creation has no idempotency key yet. An ambiguous client retry can create a second order; exactly-once behavior is not claimed before Phase 4.
-- Pending orders permanently consume inventory in Phase 3; cancellation, payment failure, expiry, and compensating restock arrive with later workflows.
-- User-service and order-service currently share one PostgreSQL database, so schema ownership is separated in code rather than by database credentials/schema.
-- PASETO v4.local requires both services to share symmetric verification authority; asymmetric service verification is deferred to a later trust-boundary revision.
+- Auth, commerce, and payment rate limiters are process-local. Distributed enforcement belongs at ingress or in a later Redis-backed implementation.
+- Registration creates a zero-balance account. A customer funding/deposit API and external payment provider are not implemented; payment success tests seed internal balances directly.
+- Pending orders consume inventory; cancellation, expiry, payment-failure records, refunds, and compensating restock are not implemented.
+- User, order, and payment services still share PostgreSQL so the account debit, payment ledger, and order transition remain one transaction; extracting those data owners requires an explicit saga/outbox design.
+- Order/payment availability now depends on identity gRPC for protected requests. They fail closed with `503`; public catalog and process liveness remain available.
+- PASETO remains symmetric, but only user-service holds the key. A user-service key compromise still grants token minting authority.
 - Email verification, password reset, MFA, account deletion, and audit history are not implemented.
 - Redis is provisioned but not consumed by application code yet.
 - The local PostgreSQL bootstrap role owns the development database; separate production migrator/runtime roles arrive with production deployment work.

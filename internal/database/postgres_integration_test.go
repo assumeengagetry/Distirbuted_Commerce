@@ -40,6 +40,13 @@ func TestPostgresConnectionAndMigration(t *testing.T) {
 	if orderValue != 1 {
 		t.Fatalf("OrderHealthCheck() = %d, want 1", orderValue)
 	}
+	paymentValue, err := store.New(pool).PaymentHealthCheck(ctx)
+	if err != nil {
+		t.Fatalf("PaymentHealthCheck() error = %v", err)
+	}
+	if paymentValue != 1 {
+		t.Fatalf("PaymentHealthCheck() = %d, want 1", paymentValue)
+	}
 
 	var extensionExists bool
 	if err := pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pgcrypto')`).Scan(&extensionExists); err != nil {

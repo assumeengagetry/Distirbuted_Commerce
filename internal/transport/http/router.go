@@ -14,7 +14,7 @@ import (
 type Dependencies struct {
 	Logger           *slog.Logger
 	ServiceName      string
-	ReadinessCheck   func(context.Context) error
+	ReadinessChecks  map[string]func(context.Context) error
 	ReadinessTimeout time.Duration
 	UserService      UserService
 	TokenVerifier    AccessTokenVerifier
@@ -33,7 +33,7 @@ func NewRouter(deps Dependencies) (*gin.Engine, error) {
 		return nil, fmt.Errorf("clock is required")
 	}
 	router, err := newBaseRouter(baseDependencies{
-		Logger: deps.Logger, ServiceName: deps.ServiceName, ReadinessCheck: deps.ReadinessCheck,
+		Logger: deps.Logger, ServiceName: deps.ServiceName, ReadinessChecks: deps.ReadinessChecks,
 		ReadinessTimeout: deps.ReadinessTimeout,
 	})
 	if err != nil {
@@ -51,7 +51,7 @@ func NewRouter(deps Dependencies) (*gin.Engine, error) {
 	authRoutes.POST("/refresh", userHandler.refresh)
 	authRoutes.POST("/logout", userHandler.logout)
 
-	protected := router.Group("/v1", authenticate(deps.TokenVerifier, deps.Now))
+	protected := router.Group("/v1", authenticate(deps.TokenVerifier))
 	protected.GET("/users/me", userHandler.me)
 
 	return router, nil
@@ -60,7 +60,7 @@ func NewRouter(deps Dependencies) (*gin.Engine, error) {
 type baseDependencies struct {
 	Logger           *slog.Logger
 	ServiceName      string
-	ReadinessCheck   func(context.Context) error
+	ReadinessChecks  map[string]func(context.Context) error
 	ReadinessTimeout time.Duration
 }
 
@@ -71,8 +71,13 @@ func newBaseRouter(deps baseDependencies) (*gin.Engine, error) {
 	if deps.ServiceName == "" {
 		return nil, fmt.Errorf("service name is required")
 	}
-	if deps.ReadinessCheck == nil {
-		return nil, fmt.Errorf("readiness check is required")
+	if len(deps.ReadinessChecks) == 0 {
+		return nil, fmt.Errorf("at least one readiness check is required")
+	}
+	for name, check := range deps.ReadinessChecks {
+		if name == "" || check == nil {
+			return nil, fmt.Errorf("readiness check names and functions are required")
+		}
 	}
 	if deps.ReadinessTimeout <= 0 {
 		return nil, fmt.Errorf("readiness timeout must be positive")
@@ -93,7 +98,7 @@ func newBaseRouter(deps baseDependencies) (*gin.Engine, error) {
 	})
 
 	handler := healthHandler{
-		serviceName: deps.ServiceName, readinessCheck: deps.ReadinessCheck, checkTimeout: deps.ReadinessTimeout,
+		serviceName: deps.ServiceName, readinessChecks: deps.ReadinessChecks, checkTimeout: deps.ReadinessTimeout,
 	}
 	handler.register(router)
 	return router, nil

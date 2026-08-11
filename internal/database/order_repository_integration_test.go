@@ -7,8 +7,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
-	"log/slog"
 	"os"
 	"sort"
 	"strings"
@@ -17,8 +15,11 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/assumeengagetry/distributed-commerce/internal/idempotency"
 	commerce "github.com/assumeengagetry/distributed-commerce/internal/order"
 )
 
@@ -194,12 +195,13 @@ func TestOrderRepositoryConcurrentSingleInventory(t *testing.T) {
 		go func() {
 			defer waitGroup.Done()
 			<-start
-			_, err := repository.CreateOrder(ctx, customerID, commerce.CreateOrderParams{
+			params := repositoryOrderParams(commerce.CreateOrderParams{
 				OrderID: uuid.New(),
 				Items: []commerce.RequestedItem{{
 					ItemID: uuid.New(), ProductID: productID, Quantity: 1, ExpectedProductVersion: 1,
 				}},
 			})
+			_, err := repository.CreateOrder(ctx, customerID, params)
 			outcomes <- err
 		}()
 	}
@@ -225,7 +227,157 @@ func TestOrderRepositoryConcurrentSingleInventory(t *testing.T) {
 	assertCommerceCounts(t, ctx, pool, customerID, 1, 1)
 }
 
-func TestOrderServiceConcurrentOpposingItemOrder(t *testing.T) {
+func TestOrderRepositoryConcurrentIdempotentReplay(t *testing.T) {
+	ctx, pool, repository := openOrderRepositoryIntegration(t)
+	adminID := createCommerceActor(t, ctx, pool, commerce.RoleAdmin)
+	customerID := createCommerceActor(t, ctx, pool, commerce.RoleCustomer)
+	productID := uuid.New()
+	registerCommerceCleanup(t, pool, []uuid.UUID{adminID, customerID}, []uuid.UUID{productID})
+	createIntegrationProduct(t, ctx, repository, adminID, productID, uniqueIntegrationSKU("IDEM-ORDER"), 900, 1)
+
+	const contenders = 20
+	start := make(chan struct{})
+	outcomes := make(chan commerce.Order, contenders)
+	errorsCh := make(chan error, contenders)
+	var waitGroup sync.WaitGroup
+	for range contenders {
+		waitGroup.Add(1)
+		go func() {
+			defer waitGroup.Done()
+			<-start
+			result, err := repository.CreateOrder(
+				ctx, customerID, idempotentOrderParams(productID, 1, "shared-order-key", "shared-request"),
+			)
+			outcomes <- result
+			errorsCh <- err
+		}()
+	}
+	close(start)
+	waitGroup.Wait()
+	close(outcomes)
+	close(errorsCh)
+	for err := range errorsCh {
+		if err != nil {
+			t.Fatalf("idempotent CreateOrder() error = %v", err)
+		}
+	}
+	var orderID uuid.UUID
+	var original, replays int
+	for result := range outcomes {
+		if orderID == uuid.Nil {
+			orderID = result.ID
+		}
+		if result.ID != orderID {
+			t.Fatalf("idempotent results used different orders: %s and %s", orderID, result.ID)
+		}
+		if result.IdempotencyReplay {
+			replays++
+		} else {
+			original++
+		}
+	}
+	if original != 1 || replays != contenders-1 {
+		t.Fatalf("idempotent outcomes = %d original, %d replays", original, replays)
+	}
+	assertInventoryQuantity(t, ctx, pool, productID, 0)
+	assertCommerceCounts(t, ctx, pool, customerID, 1, 1)
+	var storedKeyHash []byte
+	if err := pool.QueryRow(ctx, `
+		SELECT key_hash FROM idempotency_keys
+		WHERE actor_id = $1 AND operation = $2
+	`, customerID, idempotency.OrderCreateOperation).Scan(&storedKeyHash); err != nil {
+		t.Fatalf("query stored idempotency key hash: %v", err)
+	}
+	if len(storedKeyHash) != 32 || bytes.Equal(storedKeyHash, []byte("shared-order-key")) {
+		t.Fatalf("stored key is not a SHA-256 digest: %x", storedKeyHash)
+	}
+
+	_, err := repository.CreateOrder(
+		ctx, customerID, idempotentOrderParams(productID, 1, "shared-order-key", "different-request"),
+	)
+	if !errors.Is(err, commerce.ErrIdempotencyConflict) {
+		t.Fatalf("same key different request error = %v, want ErrIdempotencyConflict", err)
+	}
+}
+
+func TestOrderRepositoryIdempotencyFailureAndCommitResolution(t *testing.T) {
+	ctx, pool, repository := openOrderRepositoryIntegration(t)
+	adminID := createCommerceActor(t, ctx, pool, commerce.RoleAdmin)
+	customerID := createCommerceActor(t, ctx, pool, commerce.RoleCustomer)
+	productID, secondProductID := uuid.New(), uuid.New()
+	registerCommerceCleanup(
+		t, pool, []uuid.UUID{adminID, customerID}, []uuid.UUID{productID, secondProductID},
+	)
+	createIntegrationProduct(t, ctx, repository, adminID, productID, uniqueIntegrationSKU("COMMIT-ORDER"), 1200, 1)
+
+	failed := idempotentOrderParams(productID, 2, "retry-after-stock", "quantity-two")
+	if _, err := repository.CreateOrder(ctx, customerID, failed); !errors.Is(err, commerce.ErrInsufficientInventory) {
+		t.Fatalf("insufficient CreateOrder() error = %v", err)
+	}
+	assertIdempotencyRows(t, ctx, pool, customerID, "orders.create.v1", 0)
+	if _, err := repository.AdjustInventory(ctx, adminID, productID, commerce.AdjustInventoryRequest{
+		ExpectedVersion: 1, Delta: 1,
+	}); err != nil {
+		t.Fatalf("restock after failed idempotent order: %v", err)
+	}
+	if _, err := repository.CreateOrder(ctx, customerID, failed); err != nil {
+		t.Fatalf("retry after restock error = %v", err)
+	}
+	assertIdempotencyRows(t, ctx, pool, customerID, "orders.create.v1", 1)
+
+	if _, err := repository.CreateProduct(ctx, adminID, commerce.CreateProductParams{
+		ProductID: secondProductID,
+		Request: commerce.CreateProductRequest{
+			SKU: uniqueIntegrationSKU("ACK-ORDER"), Name: "Commit Ack Product", PriceAmount: 500,
+			Currency: commerce.CurrencyUSD, Status: commerce.ProductStatusActive, InitialQuantity: 1,
+		},
+	}); err != nil {
+		t.Fatalf("create commit resolution product: %v", err)
+	}
+	repository.commitTransaction = func(ctx context.Context, tx pgx.Tx) error {
+		if err := tx.Commit(ctx); err != nil {
+			return err
+		}
+		return &pgconn.PgError{Code: "08007", Severity: "ERROR", Message: "synthetic transaction resolution unknown"}
+	}
+	resolved, err := repository.CreateOrder(
+		ctx, customerID, idempotentOrderParams(secondProductID, 1, "commit-resolve", "commit-resolve"),
+	)
+	if err != nil {
+		t.Fatalf("resolved CreateOrder() error = %v", err)
+	}
+	if !resolved.IdempotencyReplay {
+		t.Fatal("resolved commit was not marked as an idempotency replay")
+	}
+	assertInventoryQuantity(t, ctx, pool, secondProductID, 0)
+}
+
+func TestOrderRepositoryUnknownCommitOutcomeDoesNotRetry(t *testing.T) {
+	ctx, pool, repository := openOrderRepositoryIntegration(t)
+	adminID := createCommerceActor(t, ctx, pool, commerce.RoleAdmin)
+	customerID := createCommerceActor(t, ctx, pool, commerce.RoleCustomer)
+	productID := uuid.New()
+	registerCommerceCleanup(t, pool, []uuid.UUID{adminID, customerID}, []uuid.UUID{productID})
+	createIntegrationProduct(t, ctx, repository, adminID, productID, uniqueIntegrationSKU("UNKNOWN-ORDER"), 700, 1)
+	repository.commitResolutionTimeout = 75 * time.Millisecond
+	repository.commitTransaction = func(ctx context.Context, tx pgx.Tx) error {
+		if err := tx.Rollback(ctx); err != nil {
+			return err
+		}
+		return errors.New("synthetic unknown commit outcome")
+	}
+	_, err := repository.CreateOrder(
+		ctx, customerID, idempotentOrderParams(productID, 1, "unknown-outcome", "unknown-outcome"),
+	)
+	if !errors.Is(err, commerce.ErrOperationOutcomeUnknown) {
+		t.Fatalf("CreateOrder() error = %v, want ErrOperationOutcomeUnknown", err)
+	}
+	assertInventoryQuantity(t, ctx, pool, productID, 1)
+	assertCommerceCounts(t, ctx, pool, customerID, 0, 0)
+	assertIdempotencyRows(t, ctx, pool, customerID, "orders.create.v1", 0)
+}
+
+func TestOrderRepositoryConcurrentOpposingItemOrder(t *testing.T) {
 	ctx, pool, repository := openOrderRepositoryIntegration(t)
 	adminID := createCommerceActor(t, ctx, pool, commerce.RoleAdmin)
 	customerID := createCommerceActor(t, ctx, pool, commerce.RoleCustomer)
@@ -233,22 +385,15 @@ func TestOrderServiceConcurrentOpposingItemOrder(t *testing.T) {
 	registerCommerceCleanup(t, pool, []uuid.UUID{adminID, customerID}, []uuid.UUID{productA, productB})
 	createIntegrationProduct(t, ctx, repository, adminID, productA, uniqueIntegrationSKU("LOCK-A"), 100, 2)
 	createIntegrationProduct(t, ctx, repository, adminID, productB, uniqueIntegrationSKU("LOCK-B"), 200, 2)
-	service, err := commerce.NewService(
-		repository, slog.New(slog.NewJSONHandler(io.Discard, nil)), 10*time.Second,
-	)
-	if err != nil {
-		t.Fatalf("commerce.NewService() error = %v", err)
-	}
-	actor := commerce.Actor{UserID: customerID, Role: commerce.RoleCustomer}
-	requests := []commerce.CreateOrderRequest{
-		{Items: []commerce.RequestedItem{
-			{ProductID: productA, Quantity: 1, ExpectedProductVersion: 1},
-			{ProductID: productB, Quantity: 1, ExpectedProductVersion: 1},
-		}},
-		{Items: []commerce.RequestedItem{
-			{ProductID: productB, Quantity: 1, ExpectedProductVersion: 1},
-			{ProductID: productA, Quantity: 1, ExpectedProductVersion: 1},
-		}},
+	requests := []commerce.CreateOrderParams{
+		repositoryOrderParams(commerce.CreateOrderParams{OrderID: uuid.New(), Items: []commerce.RequestedItem{
+			{ItemID: uuid.New(), ProductID: productA, Quantity: 1, ExpectedProductVersion: 1},
+			{ItemID: uuid.New(), ProductID: productB, Quantity: 1, ExpectedProductVersion: 1},
+		}}),
+		repositoryOrderParams(commerce.CreateOrderParams{OrderID: uuid.New(), Items: []commerce.RequestedItem{
+			{ItemID: uuid.New(), ProductID: productB, Quantity: 1, ExpectedProductVersion: 1},
+			{ItemID: uuid.New(), ProductID: productA, Quantity: 1, ExpectedProductVersion: 1},
+		}}),
 	}
 	start := make(chan struct{})
 	outcomes := make(chan error, len(requests))
@@ -258,7 +403,7 @@ func TestOrderServiceConcurrentOpposingItemOrder(t *testing.T) {
 		go func() {
 			defer waitGroup.Done()
 			<-start
-			_, err := service.CreateOrder(ctx, actor, request)
+			_, err := repository.CreateOrder(ctx, customerID, request)
 			outcomes <- err
 		}()
 	}
@@ -286,12 +431,13 @@ func TestOrderRepositoryKeysetPaginationWithEqualTimestamps(t *testing.T) {
 			t, ctx, repository, adminID, productID,
 			uniqueIntegrationSKU(fmt.Sprintf("PAGE-%d", index)), int64(100+index), 1,
 		)
-		_, err := repository.CreateOrder(ctx, customerID, commerce.CreateOrderParams{
+		params := repositoryOrderParams(commerce.CreateOrderParams{
 			OrderID: uuid.New(),
 			Items: []commerce.RequestedItem{{
 				ItemID: uuid.New(), ProductID: productID, Quantity: 1, ExpectedProductVersion: 1,
 			}},
 		})
+		_, err := repository.CreateOrder(ctx, customerID, params)
 		if err != nil {
 			t.Fatalf("create pagination order %d: %v", index, err)
 		}
@@ -360,7 +506,7 @@ func openOrderRepositoryIntegration(t *testing.T) (context.Context, *pgxpool.Poo
 		t.Fatalf("Open() error = %v", err)
 	}
 	t.Cleanup(pool.Close)
-	return ctx, pool, NewOrderRepository(pool, 5*time.Second, 10*time.Second)
+	return ctx, pool, NewOrderRepository(pool, 5*time.Second, 10*time.Second, 2*time.Second)
 }
 
 func createCommerceActor(t *testing.T, ctx context.Context, pool *pgxpool.Pool, role string) uuid.UUID {
@@ -417,7 +563,26 @@ func integrationOrderParams(productA, productB uuid.UUID, quantityA, quantityB i
 	sort.Slice(items, func(i, j int) bool {
 		return bytes.Compare(items[i].ProductID[:], items[j].ProductID[:]) < 0
 	})
-	return commerce.CreateOrderParams{OrderID: uuid.New(), Items: items}
+	return repositoryOrderParams(commerce.CreateOrderParams{OrderID: uuid.New(), Items: items})
+}
+
+func repositoryOrderParams(params commerce.CreateOrderParams) commerce.CreateOrderParams {
+	keyHash := idempotency.KeyHash(uuid.NewString())
+	requestHash := idempotency.RequestHash(idempotency.OrderCreateOperation, params.OrderID[:])
+	params.KeyHash = keyHash[:]
+	params.RequestHash = requestHash[:]
+	return params
+}
+
+func idempotentOrderParams(productID uuid.UUID, quantity int64, key, semanticRequest string) commerce.CreateOrderParams {
+	keyHash := idempotency.KeyHash(key)
+	requestHash := idempotency.RequestHash(idempotency.OrderCreateOperation, []byte(semanticRequest))
+	return commerce.CreateOrderParams{
+		OrderID: uuid.New(), KeyHash: keyHash[:], RequestHash: requestHash[:],
+		Items: []commerce.RequestedItem{{
+			ItemID: uuid.New(), ProductID: productID, Quantity: quantity, ExpectedProductVersion: 1,
+		}},
+	}
 }
 
 func uniqueIntegrationSKU(prefix string) string {
@@ -519,5 +684,25 @@ func assertCommerceCounts(
 	}
 	if orders != wantOrders || items != wantItems {
 		t.Fatalf("commerce row counts = orders:%d items:%d, want %d/%d", orders, items, wantOrders, wantItems)
+	}
+}
+
+func assertIdempotencyRows(
+	t *testing.T,
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	actorID uuid.UUID,
+	operation string,
+	want int,
+) {
+	t.Helper()
+	var count int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM idempotency_keys WHERE actor_id = $1 AND operation = $2
+	`, actorID, operation).Scan(&count); err != nil {
+		t.Fatalf("count idempotency rows: %v", err)
+	}
+	if count != want {
+		t.Fatalf("idempotency row count = %d, want %d", count, want)
 	}
 }

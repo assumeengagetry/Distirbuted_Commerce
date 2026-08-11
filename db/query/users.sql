@@ -24,7 +24,7 @@ INSERT INTO accounts (
 ) VALUES (
     $1, $2, $3, 0, $4, $4
 )
-RETURNING id, user_id, currency, balance, created_at, updated_at;
+RETURNING id, user_id, currency, balance, created_at, updated_at, balance_version;
 
 -- name: GetUserCredentialsByEmail :one
 SELECT
