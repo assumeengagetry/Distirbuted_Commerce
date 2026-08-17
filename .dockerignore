@@ -1,0 +1,11 @@
+.git
+.github
+.idea
+.vscode
+.env*
+.secrets
+bin
+coverage
+deploy
+docs
+README.md

@@ -1,0 +1,151 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: commerce-user
+  namespace: commerce
+  labels:
+    app.kubernetes.io/name: distributed-commerce
+    app.kubernetes.io/component: user
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: distributed-commerce
+      app.kubernetes.io/component: user
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: distributed-commerce
+        app.kubernetes.io/component: user
+    spec:
+      serviceAccountName: commerce-user
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: distributed-commerce
+              app.kubernetes.io/component: user
+      containers:
+        - name: user-service
+          image: distributed-commerce/user-service:phase8
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: https
+              containerPort: 8081
+              protocol: TCP
+            - name: identity
+              containerPort: 9091
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: commerce-common
+            - configMapRef:
+                name: commerce-user
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: commerce-runtime
+                  key: database-url-user
+            - name: PASETO_V4_LOCAL_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: commerce-runtime
+                  key: paseto-v4-local-key
+            - name: QUEUE_REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: commerce-runtime
+                  key: queue-redis-password
+            - name: GOMEMLIMIT
+              value: 400MiB
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "2"
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          startupProbe:
+            httpGet:
+              scheme: HTTPS
+              path: /healthz
+              port: https
+            periodSeconds: 2
+            timeoutSeconds: 2
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              scheme: HTTPS
+              path: /readyz
+              port: https
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+          livenessProbe:
+            httpGet:
+              scheme: HTTPS
+              path: /healthz
+              port: https
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          volumeMounts:
+            - name: http-tls
+              mountPath: /var/run/secrets/http
+              readOnly: true
+            - name: grpc-tls
+              mountPath: /var/run/secrets/grpc
+              readOnly: true
+            - name: identity-ca
+              mountPath: /var/run/secrets/identity-ca
+              readOnly: true
+            - name: postgres-ca
+              mountPath: /var/run/secrets/postgres
+              readOnly: true
+            - name: redis-ca
+              mountPath: /var/run/secrets/redis
+              readOnly: true
+      volumes:
+        - name: http-tls
+          secret:
+            secretName: commerce-user-http-tls
+            defaultMode: 288
+        - name: grpc-tls
+          secret:
+            secretName: commerce-user-grpc-tls
+            defaultMode: 288
+        - name: identity-ca
+          secret:
+            secretName: commerce-identity-ca
+            defaultMode: 288
+        - name: postgres-ca
+          secret:
+            secretName: commerce-postgres-ca
+            defaultMode: 288
+        - name: redis-ca
+          secret:
+            secretName: commerce-queue-redis-ca
+            defaultMode: 288

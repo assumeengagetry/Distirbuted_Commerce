@@ -9,6 +9,8 @@ ORDER_BINARY := bin/order-service
 PAYMENT_BINARY := bin/payment-service
 WORKER_BINARY := bin/job-worker
 JOB_ADMIN_BINARY := bin/job-admin
+MIGRATOR_BINARY := bin/migrator
+PROBE_BINARY := bin/loopback-probe
 MIGRATE_VERSION := v4.18.3
 MIGRATE_BIN := $(CURDIR)/bin/migrate-$(MIGRATE_VERSION)
 MIGRATE_PACKAGE := github.com/golang-migrate/migrate/v4/cmd/migrate@$(MIGRATE_VERSION)
@@ -27,6 +29,20 @@ SQLC_PACKAGE := github.com/sqlc-dev/sqlc/cmd/sqlc@$(SQLC_VERSION)
 GOVULNCHECK_VERSION := v1.6.0
 GOVULNCHECK_BIN := $(CURDIR)/bin/govulncheck-$(GOVULNCHECK_VERSION)
 GOVULNCHECK_PACKAGE := golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION)
+KUSTOMIZE_VERSION := v5.8.1
+KUSTOMIZE_BIN := $(CURDIR)/bin/kustomize-$(KUSTOMIZE_VERSION)
+KUSTOMIZE_PACKAGE := sigs.k8s.io/kustomize/kustomize/v5@$(KUSTOMIZE_VERSION)
+KUBECONFORM_VERSION := v0.7.0
+KUBECONFORM_BIN := $(CURDIR)/bin/kubeconform-$(KUBECONFORM_VERSION)
+KUBECONFORM_PACKAGE := github.com/yannh/kubeconform/cmd/kubeconform@$(KUBECONFORM_VERSION)
+ACTIONLINT_VERSION := v1.7.7
+ACTIONLINT_BIN := $(CURDIR)/bin/actionlint-$(ACTIONLINT_VERSION)
+ACTIONLINT_PACKAGE := github.com/rhysd/actionlint/cmd/actionlint@$(ACTIONLINT_VERSION)
+IMAGE_SERVICES := user-service order-service payment-service job-worker job-admin migrator
+IMAGE_PREFIX ?= localhost/distributed-commerce
+IMAGE_VERSION ?= dev
+IMAGE_REVISION ?= $(shell git rev-parse --short=12 HEAD 2>/dev/null || printf 'unknown')
+PODMAN_BUILD_FLAGS ?=
 SECRETS_DIR := $(CURDIR)/.secrets
 QUADLET_FILES := \
 	deploy/quadlet/commerce-postgres.volume \
@@ -34,7 +50,7 @@ QUADLET_FILES := \
 	deploy/quadlet/commerce-postgres.container \
 	deploy/quadlet/commerce-redis.container
 
-.PHONY: help init build run run-user run-order run-payment run-worker jobs-failed jobs-retry jobs-delete fmt fmt-check vet test test-race test-integration check release-check migrate-install \
+.PHONY: help init build benchmark openapi-check kube-check workflow-check image images run run-user run-order run-payment run-worker jobs-failed jobs-retry jobs-delete fmt fmt-check vet test test-race test-integration check release-check migrate-install \
 	sqlc sqlc-vet secrets quadlet-check quadlet-install infra-up infra-down infra-status infra-logs \
 	migrate-up migrate-down migrate-version migrate-create require-env require-database-secret require-redis-secret require-user-secrets require-infra-secrets \
 	proto-tools proto-format proto-lint proto-generate proto-check mod-check vulncheck test-database
@@ -42,7 +58,13 @@ QUADLET_FILES := \
 help:
 	@printf '%s\n' \
 		'init              Create .env and random local secret files' \
-		'build             Build service, worker, and job-admin binaries' \
+		'build             Build services, worker, admin, migrator, and probe binaries' \
+		'benchmark         Run informational Go benchmarks; optional BENCHTIME/COUNT' \
+		'openapi-check     Validate the OpenAPI 3.1 contract' \
+		'kube-check        Render base and production Kustomize manifests' \
+		'workflow-check    Lint GitHub Actions workflows' \
+		'image             Build one OCI image; pass SERVICE=<name>' \
+		'images            Build every production OCI image' \
 		'run               Run user-service with values from .env' \
 		'run-order         Run order-service on 127.0.0.1:8082' \
 		'run-payment       Run payment-service on 127.0.0.1:8083' \
@@ -81,6 +103,36 @@ build:
 	$(GO) build -trimpath -o $(PAYMENT_BINARY) ./cmd/payment-service
 	$(GO) build -trimpath -o $(WORKER_BINARY) ./cmd/job-worker
 	$(GO) build -trimpath -o $(JOB_ADMIN_BINARY) ./cmd/job-admin
+	$(GO) build -trimpath -o $(MIGRATOR_BINARY) ./cmd/migrator
+	$(GO) build -trimpath -o $(PROBE_BINARY) ./cmd/loopback-probe
+
+benchmark:
+	$(GO) test -run '^$$' -bench . -benchmem -benchtime=$${BENCHTIME:-1s} -count=$${COUNT:-5} ./...
+
+openapi-check:
+	$(GO) test -count=1 ./api/openapi
+
+kube-check: $(KUSTOMIZE_BIN) $(KUBECONFORM_BIN)
+	@base="$$(mktemp --suffix=.yaml)"; production="$$(mktemp --suffix=.yaml)"; trap 'rm -f "$$base" "$$production"' EXIT; \
+		$(KUSTOMIZE_BIN) build deploy/kubernetes/base >"$$base"; \
+		$(KUSTOMIZE_BIN) build deploy/kubernetes/overlays/production >"$$production"; \
+		$(KUBECONFORM_BIN) -strict -summary "$$base" "$$production"; \
+		! grep -Eq '^kind:[[:space:]]+Secret$$' "$$production" || { printf 'Rendered manifests must not contain Secret resources.\n' >&2; exit 1; }
+
+workflow-check: $(ACTIONLINT_BIN)
+	$(ACTIONLINT_BIN) .github/workflows/*.yml
+
+image:
+	@case '$(SERVICE)' in user-service|order-service|payment-service|job-worker|job-admin|migrator) ;; \
+		*) printf 'SERVICE must be one of: $(IMAGE_SERVICES)\n' >&2; exit 2 ;; esac
+	$(PODMAN) build $(PODMAN_BUILD_FLAGS) --format oci \
+		--build-arg SERVICE='$(SERVICE)' --build-arg VERSION='$(IMAGE_VERSION)' --build-arg REVISION='$(IMAGE_REVISION)' \
+		-t '$(IMAGE_PREFIX)/$(SERVICE):$(IMAGE_VERSION)' -f Containerfile .
+
+images:
+	@for service in $(IMAGE_SERVICES); do \
+		$(MAKE) --no-print-directory image SERVICE="$$service" || exit; \
+	done
 
 run: run-user
 
@@ -193,7 +245,7 @@ test-integration: require-env require-database-secret require-redis-secret $(MIG
 	$(MIGRATE_BIN) -path=db/migrations -database "$$TEST_DATABASE_URL" up; \
 	TEST_DATABASE_URL="$$TEST_DATABASE_URL" $(GO) test -count=1 -p=1 -tags=integration ./...
 
-check: proto-check fmt-check vet test test-race build sqlc-vet quadlet-check
+check: proto-check openapi-check kube-check workflow-check fmt-check vet test test-race build sqlc-vet quadlet-check
 
 release-check:
 	@$(MAKE) --no-print-directory check
@@ -252,6 +304,21 @@ $(GOVULNCHECK_BIN):
 	@mkdir -p bin
 	GOBIN='$(CURDIR)/bin' $(GO) install '$(GOVULNCHECK_PACKAGE)'
 	mv '$(CURDIR)/bin/govulncheck' '$(GOVULNCHECK_BIN)'
+
+$(KUSTOMIZE_BIN):
+	@mkdir -p bin
+	GOBIN='$(CURDIR)/bin' $(GO) install '$(KUSTOMIZE_PACKAGE)'
+	mv '$(CURDIR)/bin/kustomize' '$(KUSTOMIZE_BIN)'
+
+$(KUBECONFORM_BIN):
+	@mkdir -p bin
+	GOBIN='$(CURDIR)/bin' $(GO) install '$(KUBECONFORM_PACKAGE)'
+	mv '$(CURDIR)/bin/kubeconform' '$(KUBECONFORM_BIN)'
+
+$(ACTIONLINT_BIN):
+	@mkdir -p bin
+	GOBIN='$(CURDIR)/bin' $(GO) install '$(ACTIONLINT_PACKAGE)'
+	mv '$(CURDIR)/bin/actionlint' '$(ACTIONLINT_BIN)'
 
 migrate-install: $(MIGRATE_BIN)
 

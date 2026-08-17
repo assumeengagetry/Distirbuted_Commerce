@@ -1,0 +1,1985 @@
+openapi: 3.1.0
+jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
+info:
+  title: Distributed Commerce HTTP API
+  version: 1.0.0
+  description: |
+    Contract for the user, order, and payment HTTP servers.
+
+    JSON request bodies are strict and are limited to exactly 16 KiB (16,384
+    bytes) of encoded body data. A body must be one JSON object, its media type
+    must resolve to `application/json` (media-type parameters are allowed), and
+    it may not contain unknown fields, duplicate keys at any nesting level,
+    non-lowercase keys at any nesting level, trailing JSON values, or invalid
+    UTF-8. The serialized-body byte limit and duplicate-key rules are described
+    here because JSON Schema validates a decoded value rather than the wire
+    representation.
+
+    Authentication uses one `Authorization: Bearer <access-token>` header.
+    Responses that reach bearer authentication set `Cache-Control: no-store`;
+    authentication failures challenge with `WWW-Authenticate: Bearer`. The four auth operations are
+    limited by source IP (defaults: 2 requests/second, burst 5). Order-service
+    public operations are limited by source IP and protected operations by both
+    source IP and authenticated principal (defaults: 20 requests/second, burst
+    40). Payment operations use the same two-stage policy (defaults: 10
+    requests/second, burst 20). Limits are deployment-configurable. A rejection
+    returns `429 RATE_LIMITED` and `Retry-After` in whole seconds.
+
+    Order and payment creation require exactly one `Idempotency-Key` value.
+    Reusing the same key, principal, operation, and canonical request replays the
+    original `201`; a replay is identified by `Idempotency-Replayed: true`.
+
+    Collection operations use descending keyset pagination. `limit` defaults to
+    20 and ranges from 1 through 100. `cursor` is an opaque, canonical, unpadded
+    base64url value no longer than 512 characters. It encodes version 1, a UTC
+    RFC3339Nano creation timestamp, and a canonical non-nil UUID. Unknown,
+    duplicate, or empty query parameters are rejected.
+
+    Every response carries `X-Request-ID` and `X-Content-Type-Options: nosniff`.
+    HTTPS responses also carry `Strict-Transport-Security: max-age=31536000`.
+    Except for readiness probe failures, error responses use `ErrorEnvelope`.
+tags:
+  - name: Probes
+  - name: Auth
+  - name: Profile
+  - name: Products
+  - name: Inventory
+  - name: Orders
+  - name: Payments
+security: []
+paths:
+  /healthz:
+    get:
+      tags: [Probes]
+      operationId: getLiveness
+      summary: Check process liveness
+      description: |
+        Shared liveness probe. Error codes: none.
+      servers:
+        - url: http://127.0.0.1:8081
+          description: User service default HTTP endpoint
+        - url: http://127.0.0.1:8082
+          description: Order service default HTTP endpoint
+        - url: http://127.0.0.1:8083
+          description: Payment service default HTTP endpoint
+      responses:
+        "200":
+          description: The process is alive.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestID'
+            X-Content-Type-Options:
+              $ref: '#/components/headers/XContentTypeOptions'
+            Strict-Transport-Security:
+              $ref: '#/components/headers/StrictTransportSecurity'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LivenessProbe'
+  /readyz:
+    get:
+      tags: [Probes]
+      operationId: getReadiness
+      summary: Check dependency readiness
+      description: |
+        Shared readiness probe. A `503` uses `ReadinessProbe`, not
+        `ErrorEnvelope`. Error codes: none.
+      servers:
+        - url: http://127.0.0.1:8081
+          description: User service default HTTP endpoint
+        - url: http://127.0.0.1:8082
+          description: Order service default HTTP endpoint
+        - url: http://127.0.0.1:8083
+          description: Payment service default HTTP endpoint
+      responses:
+        "200":
+          description: Every configured dependency is ready.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestID'
+            X-Content-Type-Options:
+              $ref: '#/components/headers/XContentTypeOptions'
+            Strict-Transport-Security:
+              $ref: '#/components/headers/StrictTransportSecurity'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReadinessProbe'
+        "503":
+          description: At least one dependency is down or timed out.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestID'
+            X-Content-Type-Options:
+              $ref: '#/components/headers/XContentTypeOptions'
+            Strict-Transport-Security:
+              $ref: '#/components/headers/StrictTransportSecurity'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReadinessProbe'
+  /v1/auth/register:
+    post:
+      tags: [Auth]
+      operationId: registerUser
+      summary: Register a customer
+      description: |
+        Creates a customer, USD account, session, and token pair. The auth IP
+        rate limit applies.
+
+        Error codes: `400 INVALID_REQUEST`, `400 INVALID_EMAIL`, `400
+        INVALID_PASSWORD`, `400 INVALID_DISPLAY_NAME`; `409
+        EMAIL_ALREADY_EXISTS`; `413 REQUEST_TOO_LARGE`; `415
+        UNSUPPORTED_MEDIA_TYPE`; `429 RATE_LIMITED`; `500 INTERNAL_ERROR`; `503
+        SERVICE_UNAVAILABLE`.
+      servers:
+        - url: http://127.0.0.1:8081
+      requestBody:
+        $ref: '#/components/requestBodies/RegisterRequest'
+      responses:
+        "201":
+          description: The customer was registered.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestID'
+            X-Content-Type-Options:
+              $ref: '#/components/headers/XContentTypeOptions'
+            Strict-Transport-Security:
+              $ref: '#/components/headers/StrictTransportSecurity'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResponse'
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "409":
+          $ref: '#/components/responses/Conflict'
+        "413":
+          $ref: '#/components/responses/PayloadTooLarge'
+        "415":
+          $ref: '#/components/responses/UnsupportedMediaType'
+        "429":
+          $ref: '#/components/responses/TooManyRequests'
+        "500":
+          $ref: '#/components/responses/InternalServerError'
+        "503":
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/auth/login:
+    post:
+      tags: [Auth]
+      operationId: loginUser
+      summary: Start an authenticated session
+      description: |
+        Authenticates credentials and creates a session and token pair. Invalid
+        email syntax, unknown users, disabled users, and invalid passwords are
+        deliberately collapsed into `INVALID_CREDENTIALS`. The auth IP rate
+        limit applies.
+
+        Error codes: `400 INVALID_REQUEST`; `401 INVALID_CREDENTIALS`; `413
+        REQUEST_TOO_LARGE`; `415 UNSUPPORTED_MEDIA_TYPE`; `429 RATE_LIMITED`;
+        `500 INTERNAL_ERROR`; `503 SERVICE_UNAVAILABLE`.
+      servers:
+        - url: http://127.0.0.1:8081
+      requestBody:
+        $ref: '#/components/requestBodies/LoginRequest'
+      responses:
+        "200":
+          description: Authentication succeeded.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestID'
+            X-Content-Type-Options:
+              $ref: '#/components/headers/XContentTypeOptions'
+            Strict-Transport-Security:
+              $ref: '#/components/headers/StrictTransportSecurity'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResponse'
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "401":
+          $ref: '#/components/responses/AuthUnauthorized'
+        "413":
+          $ref: '#/components/responses/PayloadTooLarge'
+        "415":
+          $ref: '#/components/responses/UnsupportedMediaType'
+        "429":
+          $ref: '#/components/responses/TooManyRequests'
+        "500":
+          $ref: '#/components/responses/InternalServerError'
+        "503":
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/auth/refresh:
+    post:
+      tags: [Auth]
+      operationId: refreshSession
+      summary: Rotate a refresh token
+      description: |
+        Consumes the supplied refresh token and returns a replacement token
+        pair. The auth IP rate limit applies.
+
+        Error codes: `400 INVALID_REQUEST`; `401 INVALID_REFRESH_TOKEN`; `413
+        REQUEST_TOO_LARGE`; `415 UNSUPPORTED_MEDIA_TYPE`; `429 RATE_LIMITED`;
+        `500 INTERNAL_ERROR`; `503 SERVICE_UNAVAILABLE`.
+      servers:
+        - url: http://127.0.0.1:8081
+      requestBody:
+        $ref: '#/components/requestBodies/RefreshRequest'
+      responses:
+        "200":
+          description: The refresh token was rotated.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestID'
+            X-Content-Type-Options:
+              $ref: '#/components/headers/XContentTypeOptions'
+            Strict-Transport-Security:
+              $ref: '#/components/headers/StrictTransportSecurity'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResponse'
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "401":
+          $ref: '#/components/responses/AuthUnauthorized'
+        "413":
+          $ref: '#/components/responses/PayloadTooLarge'
+        "415":
+          $ref: '#/components/responses/UnsupportedMediaType'
+        "429":
+          $ref: '#/components/responses/TooManyRequests'
+        "500":
+          $ref: '#/components/responses/InternalServerError'
+        "503":
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/auth/logout:
+    post:
+      tags: [Auth]
+      operationId: logoutSession
+      summary: Revoke a session
+      description: |
+        Revokes the session identified by a refresh token. Missing, malformed,
+        unknown, expired, and already-revoked tokens are intentionally
+        idempotent successes. The auth IP rate limit applies.
+
+        Error codes: `400 INVALID_REQUEST`; `413 REQUEST_TOO_LARGE`; `415
+        UNSUPPORTED_MEDIA_TYPE`; `429 RATE_LIMITED`; `500 INTERNAL_ERROR`.
+      servers:
+        - url: http://127.0.0.1:8081
+      requestBody:
+        $ref: '#/components/requestBodies/LogoutRequest'
+      responses:
+        "204":
+          description: The session is no longer active.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestID'
+            X-Content-Type-Options:
+              $ref: '#/components/headers/XContentTypeOptions'
+            Strict-Transport-Security:
+              $ref: '#/components/headers/StrictTransportSecurity'
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "413":
+          $ref: '#/components/responses/PayloadTooLarge'
+        "415":
+          $ref: '#/components/responses/UnsupportedMediaType'
+        "429":
+          $ref: '#/components/responses/TooManyRequests'
+        "500":
+          $ref: '#/components/responses/InternalServerError'
+  /v1/users/me:
+    get:
+      tags: [Profile]
+      operationId: getCurrentProfile
+      summary: Get the current profile
+      description: |
+        This user-service route is authenticated but is not covered by the auth
+        endpoint IP rate limiter.
+
+        Error codes: `401 UNAUTHORIZED`, `401 ACCOUNT_DISABLED`; `404
+        USER_NOT_FOUND`; `500 INTERNAL_ERROR`; `503 IDENTITY_UNAVAILABLE`.
+      servers:
+        - url: http://127.0.0.1:8081
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Current user and account profile.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestID'
+            X-Content-Type-Options:
+              $ref: '#/components/headers/XContentTypeOptions'
+            Strict-Transport-Security:
+              $ref: '#/components/headers/StrictTransportSecurity'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProfileResponse'
+        "401":
+          $ref: '#/components/responses/BearerUnauthorized'
+        "404":
+          $ref: '#/components/responses/NotFound'
+        "500":
+          $ref: '#/components/responses/InternalServerError'
+        "503":
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/products:
+    get:
+      tags: [Products]
+      operationId: listProducts
+      summary: List active products
+      description: |
+        Public, source-IP-limited keyset listing. Only active products are
+        returned, and inventory quantity and administrative status are hidden.
+
+        Error codes: `400 INVALID_QUERY`, `400 INVALID_CURSOR`; `429
+        RATE_LIMITED`; `500 INTERNAL_ERROR`; `503 SERVICE_UNAVAILABLE`.
+      servers:
+        - url: http://127.0.0.1:8082
+      parameters:
+        - $ref: '#/components/parameters/PageLimit'
+        - $ref: '#/components/parameters/PageCursor'
+      responses:
+        "200":
+          description: A page of active products.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestID'
+            X-Content-Type-Options:
+              $ref: '#/components/headers/XContentTypeOptions'
+            Strict-Transport-Security:
+              $ref: '#/components/headers/StrictTransportSecurity'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProductPageResponse'
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "429":
+          $ref: '#/components/responses/TooManyRequests'
+        "500":
+          $ref: '#/components/responses/InternalServerError'
+        "503":
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/products/{product_id}:
+    parameters:
+      - $ref: '#/components/parameters/ProductID'
+    get:
+      tags: [Products]
+      operationId: getProduct
+      summary: Get an active product
+      description: |
+        Public, source-IP-limited product detail. Inactive and unknown products
+        are both reported as not found.
+
+        Error codes: `400 INVALID_PRODUCT_ID`; `404 PRODUCT_NOT_FOUND`; `429
+        RATE_LIMITED`; `500 INTERNAL_ERROR`; `503 SERVICE_UNAVAILABLE`.
+      servers:
+        - url: http://127.0.0.1:8082
+      responses:
+        "200":
+          description: Public product detail.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestID'
+            X-Content-Type-Options:
+              $ref: '#/components/headers/XContentTypeOptions'
+            Strict-Transport-Security:
+              $ref: '#/components/headers/StrictTransportSecurity'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProductResponse'
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "404":
+          $ref: '#/components/responses/NotFound'
+        "429":
+          $ref: '#/components/responses/TooManyRequests'
+        "500":
+          $ref: '#/components/responses/InternalServerError'
+        "503":
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/admin/products:
+    post:
+      tags: [Products]
+      operationId: createProduct
+      summary: Create a product
+      description: |
+        Admin-only product and initial-inventory creation. The protected order
+        service IP and principal limits apply.
+
+        Error codes: `400 INVALID_REQUEST`, `400 INVALID_SKU`, `400
+        INVALID_PRODUCT_NAME`, `400 INVALID_DESCRIPTION`, `400 INVALID_PRICE`,
+        `400 INVALID_CURRENCY`, `400 INVALID_PRODUCT_STATUS`, `400
+        INVALID_INITIAL_QUANTITY`; `401 UNAUTHORIZED`, `401 ACCOUNT_DISABLED`;
+        `403 FORBIDDEN`; `409 SKU_ALREADY_EXISTS`; `413 REQUEST_TOO_LARGE`; `415
+        UNSUPPORTED_MEDIA_TYPE`; `429 RATE_LIMITED`; `500 INTERNAL_ERROR`; `503
+        IDENTITY_UNAVAILABLE`, `503 SERVICE_UNAVAILABLE`.
+      servers:
+        - url: http://127.0.0.1:8082
+      security:
+        - bearerAuth: []
+      requestBody:
+        $ref: '#/components/requestBodies/CreateProductRequest'
+      responses:
+        "201":
+          description: Product and inventory created.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestID'
+            X-Content-Type-Options:
+              $ref: '#/components/headers/XContentTypeOptions'
+            Strict-Transport-Security:
+              $ref: '#/components/headers/StrictTransportSecurity'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+            Location:
+              $ref: '#/components/headers/Location'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminProductResponse'
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "401":
+          $ref: '#/components/responses/BearerUnauthorized'
+        "403":
+          $ref: '#/components/responses/Forbidden'
+        "409":
+          $ref: '#/components/responses/Conflict'
+        "413":
+          $ref: '#/components/responses/PayloadTooLarge'
+        "415":
+          $ref: '#/components/responses/UnsupportedMediaType'
+        "429":
+          $ref: '#/components/responses/TooManyRequests'
+        "500":
+          $ref: '#/components/responses/InternalServerError'
+        "503":
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/admin/products/{product_id}:
+    parameters:
+      - $ref: '#/components/parameters/ProductID'
+    get:
+      tags: [Products]
+      operationId: getAdminProduct
+      summary: Get product and inventory detail
+      description: |
+        Admin-only detail, including inactive products and exact inventory.
+
+        Error codes: `400 INVALID_PRODUCT_ID`; `401 UNAUTHORIZED`, `401
+        ACCOUNT_DISABLED`; `403 FORBIDDEN`; `404 PRODUCT_NOT_FOUND`; `429
+        RATE_LIMITED`; `500 INTERNAL_ERROR`; `503 IDENTITY_UNAVAILABLE`, `503
+        SERVICE_UNAVAILABLE`.
+      servers:
+        - url: http://127.0.0.1:8082
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Administrative product detail.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestID'
+            X-Content-Type-Options:
+              $ref: '#/components/headers/XContentTypeOptions'
+            Strict-Transport-Security:
+              $ref: '#/components/headers/StrictTransportSecurity'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminProductResponse'
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "401":
+          $ref: '#/components/responses/BearerUnauthorized'
+        "403":
+          $ref: '#/components/responses/Forbidden'
+        "404":
+          $ref: '#/components/responses/NotFound'
+        "429":
+          $ref: '#/components/responses/TooManyRequests'
+        "500":
+          $ref: '#/components/responses/InternalServerError'
+        "503":
+          $ref: '#/components/responses/ServiceUnavailable'
+    patch:
+      tags: [Products]
+      operationId: updateProduct
+      summary: Update mutable product fields
+      description: |
+        Admin-only optimistic update. `expected_version` must match the current
+        product version, and at least one mutable field must be supplied.
+
+        Error codes: `400 INVALID_PRODUCT_ID`, `400 INVALID_REQUEST`, `400
+        INVALID_EXPECTED_VERSION`, `400 EMPTY_PRODUCT_UPDATE`, `400
+        INVALID_PRODUCT_NAME`, `400 INVALID_DESCRIPTION`, `400 INVALID_PRICE`,
+        `400 INVALID_PRODUCT_STATUS`; `401 UNAUTHORIZED`, `401
+        ACCOUNT_DISABLED`; `403 FORBIDDEN`; `404 PRODUCT_NOT_FOUND`; `409
+        PRODUCT_VERSION_CONFLICT`; `413 REQUEST_TOO_LARGE`; `415
+        UNSUPPORTED_MEDIA_TYPE`; `429 RATE_LIMITED`; `500 INTERNAL_ERROR`; `503
+        IDENTITY_UNAVAILABLE`, `503 SERVICE_UNAVAILABLE`.
+      servers:
+        - url: http://127.0.0.1:8082
+      security:
+        - bearerAuth: []
+      requestBody:
+        $ref: '#/components/requestBodies/UpdateProductRequest'
+      responses:
+        "200":
+          description: Updated product and current inventory.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestID'
+            X-Content-Type-Options:
+              $ref: '#/components/headers/XContentTypeOptions'
+            Strict-Transport-Security:
+              $ref: '#/components/headers/StrictTransportSecurity'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminProductResponse'
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "401":
+          $ref: '#/components/responses/BearerUnauthorized'
+        "403":
+          $ref: '#/components/responses/Forbidden'
+        "404":
+          $ref: '#/components/responses/NotFound'
+        "409":
+          $ref: '#/components/responses/Conflict'
+        "413":
+          $ref: '#/components/responses/PayloadTooLarge'
+        "415":
+          $ref: '#/components/responses/UnsupportedMediaType'
+        "429":
+          $ref: '#/components/responses/TooManyRequests'
+        "500":
+          $ref: '#/components/responses/InternalServerError'
+        "503":
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/admin/inventory:
+    get:
+      tags: [Inventory]
+      operationId: listInventory
+      summary: List inventory
+      description: |
+        Admin-only keyset listing. The cursor order is based on product creation
+        time and product UUID, while each item exposes its inventory update time.
+
+        Error codes: `400 INVALID_QUERY`, `400 INVALID_CURSOR`; `401
+        UNAUTHORIZED`, `401 ACCOUNT_DISABLED`; `403 FORBIDDEN`; `429
+        RATE_LIMITED`; `500 INTERNAL_ERROR`; `503 IDENTITY_UNAVAILABLE`, `503
+        SERVICE_UNAVAILABLE`.
+      servers:
+        - url: http://127.0.0.1:8082
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/PageLimit'
+        - $ref: '#/components/parameters/PageCursor'
+      responses:
+        "200":
+          description: A page of inventory entries.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestID'
+            X-Content-Type-Options:
+              $ref: '#/components/headers/XContentTypeOptions'
+            Strict-Transport-Security:
+              $ref: '#/components/headers/StrictTransportSecurity'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InventoryPageResponse'
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "401":
+          $ref: '#/components/responses/BearerUnauthorized'
+        "403":
+          $ref: '#/components/responses/Forbidden'
+        "429":
+          $ref: '#/components/responses/TooManyRequests'
+        "500":
+          $ref: '#/components/responses/InternalServerError'
+        "503":
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/admin/inventory/{product_id}:
+    parameters:
+      - $ref: '#/components/parameters/ProductID'
+    patch:
+      tags: [Inventory]
+      operationId: adjustInventory
+      summary: Adjust inventory
+      description: |
+        Admin-only optimistic, signed inventory adjustment. The resulting
+        quantity must remain between 0 and 1,000,000,000 inclusive.
+
+        Error codes: `400 INVALID_PRODUCT_ID`, `400 INVALID_REQUEST`, `400
+        INVALID_EXPECTED_VERSION`, `400 INVALID_INVENTORY_DELTA`; `401
+        UNAUTHORIZED`, `401 ACCOUNT_DISABLED`; `403 FORBIDDEN`; `404
+        PRODUCT_NOT_FOUND`; `409 INVENTORY_VERSION_CONFLICT`, `409
+        INVENTORY_OUT_OF_RANGE`; `413 REQUEST_TOO_LARGE`; `415
+        UNSUPPORTED_MEDIA_TYPE`; `429 RATE_LIMITED`; `500 INTERNAL_ERROR`; `503
+        IDENTITY_UNAVAILABLE`, `503 SERVICE_UNAVAILABLE`.
+      servers:
+        - url: http://127.0.0.1:8082
+      security:
+        - bearerAuth: []
+      requestBody:
+        $ref: '#/components/requestBodies/AdjustInventoryRequest'
+      responses:
+        "200":
+          description: Updated inventory entry.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestID'
+            X-Content-Type-Options:
+              $ref: '#/components/headers/XContentTypeOptions'
+            Strict-Transport-Security:
+              $ref: '#/components/headers/StrictTransportSecurity'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InventoryResponse'
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "401":
+          $ref: '#/components/responses/BearerUnauthorized'
+        "403":
+          $ref: '#/components/responses/Forbidden'
+        "404":
+          $ref: '#/components/responses/NotFound'
+        "409":
+          $ref: '#/components/responses/Conflict'
+        "413":
+          $ref: '#/components/responses/PayloadTooLarge'
+        "415":
+          $ref: '#/components/responses/UnsupportedMediaType'
+        "429":
+          $ref: '#/components/responses/TooManyRequests'
+        "500":
+          $ref: '#/components/responses/InternalServerError'
+        "503":
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/orders:
+    post:
+      tags: [Orders]
+      operationId: createOrder
+      summary: Create an order
+      description: |
+        Customer-only idempotent creation. Product IDs must be unique within the
+        request. Product version, status, price, currency, and inventory are
+        checked atomically before inventory is deducted.
+
+        Error codes: `400 INVALID_REQUEST`, `400 IDEMPOTENCY_KEY_REQUIRED`, `400
+        INVALID_IDEMPOTENCY_KEY`, `400 INVALID_ORDER_ITEMS`, `400
+        INVALID_ITEM_QUANTITY`, `400 INVALID_EXPECTED_VERSION`; `401
+        UNAUTHORIZED`, `401 ACCOUNT_DISABLED`; `403 FORBIDDEN`; `409
+        PRODUCT_UNAVAILABLE`, `409 PRODUCT_CHANGED`, `409
+        INSUFFICIENT_INVENTORY`, `409 IDEMPOTENCY_KEY_REUSED`, `409
+        IDEMPOTENCY_IN_PROGRESS`, `409 CURRENCY_MISMATCH`; `413
+        REQUEST_TOO_LARGE`; `415 UNSUPPORTED_MEDIA_TYPE`; `422
+        ORDER_AMOUNT_TOO_LARGE`; `429 RATE_LIMITED`; `500 INTERNAL_ERROR`; `503
+        IDENTITY_UNAVAILABLE`, `503 OPERATION_OUTCOME_UNKNOWN`, `503
+        SERVICE_UNAVAILABLE`.
+      servers:
+        - url: http://127.0.0.1:8082
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        $ref: '#/components/requestBodies/CreateOrderRequest'
+      responses:
+        "201":
+          description: The order was created or an identical completed request was replayed.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestID'
+            X-Content-Type-Options:
+              $ref: '#/components/headers/XContentTypeOptions'
+            Strict-Transport-Security:
+              $ref: '#/components/headers/StrictTransportSecurity'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+            Location:
+              $ref: '#/components/headers/Location'
+            Idempotency-Replayed:
+              $ref: '#/components/headers/IdempotencyReplayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderResponse'
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "401":
+          $ref: '#/components/responses/BearerUnauthorized'
+        "403":
+          $ref: '#/components/responses/Forbidden'
+        "409":
+          $ref: '#/components/responses/Conflict'
+        "413":
+          $ref: '#/components/responses/PayloadTooLarge'
+        "415":
+          $ref: '#/components/responses/UnsupportedMediaType'
+        "422":
+          $ref: '#/components/responses/UnprocessableEntity'
+        "429":
+          $ref: '#/components/responses/TooManyRequests'
+        "500":
+          $ref: '#/components/responses/InternalServerError'
+        "503":
+          $ref: '#/components/responses/ServiceUnavailable'
+    get:
+      tags: [Orders]
+      operationId: listOrders
+      summary: List visible orders
+      description: |
+        Customer tokens list only their orders; admin tokens list all orders.
+        Results use descending keyset pagination.
+
+        Error codes: `400 INVALID_QUERY`, `400 INVALID_CURSOR`; `401
+        UNAUTHORIZED`, `401 ACCOUNT_DISABLED`; `403 FORBIDDEN`; `429
+        RATE_LIMITED`; `500 INTERNAL_ERROR`; `503 IDENTITY_UNAVAILABLE`, `503
+        SERVICE_UNAVAILABLE`.
+      servers:
+        - url: http://127.0.0.1:8082
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/PageLimit'
+        - $ref: '#/components/parameters/PageCursor'
+      responses:
+        "200":
+          description: A page of orders visible to the principal.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestID'
+            X-Content-Type-Options:
+              $ref: '#/components/headers/XContentTypeOptions'
+            Strict-Transport-Security:
+              $ref: '#/components/headers/StrictTransportSecurity'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderPageResponse'
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "401":
+          $ref: '#/components/responses/BearerUnauthorized'
+        "403":
+          $ref: '#/components/responses/Forbidden'
+        "429":
+          $ref: '#/components/responses/TooManyRequests'
+        "500":
+          $ref: '#/components/responses/InternalServerError'
+        "503":
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/orders/{order_id}:
+    parameters:
+      - $ref: '#/components/parameters/OrderID'
+    get:
+      tags: [Orders]
+      operationId: getOrder
+      summary: Get a visible order
+      description: |
+        Customers can read only their own order. Admins can read any order.
+        Cross-customer reads are deliberately reported as not found.
+
+        Error codes: `400 INVALID_ORDER_ID`; `401 UNAUTHORIZED`, `401
+        ACCOUNT_DISABLED`; `403 FORBIDDEN`; `404 ORDER_NOT_FOUND`; `429
+        RATE_LIMITED`; `500 INTERNAL_ERROR`; `503 IDENTITY_UNAVAILABLE`, `503
+        SERVICE_UNAVAILABLE`.
+      servers:
+        - url: http://127.0.0.1:8082
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Order detail.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestID'
+            X-Content-Type-Options:
+              $ref: '#/components/headers/XContentTypeOptions'
+            Strict-Transport-Security:
+              $ref: '#/components/headers/StrictTransportSecurity'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderResponse'
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "401":
+          $ref: '#/components/responses/BearerUnauthorized'
+        "403":
+          $ref: '#/components/responses/Forbidden'
+        "404":
+          $ref: '#/components/responses/NotFound'
+        "429":
+          $ref: '#/components/responses/TooManyRequests'
+        "500":
+          $ref: '#/components/responses/InternalServerError'
+        "503":
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/payments:
+    post:
+      tags: [Payments]
+      operationId: createPayment
+      summary: Pay an order
+      description: |
+        Customer-only idempotent payment. The pending order and customer
+        account are locked; funds are debited, payment is recorded, and the
+        order becomes paid in one transaction.
+
+        Error codes: `400 INVALID_REQUEST`, `400 INVALID_ORDER_ID`, `400
+        IDEMPOTENCY_KEY_REQUIRED`, `400 INVALID_IDEMPOTENCY_KEY`; `401
+        UNAUTHORIZED`, `401 ACCOUNT_DISABLED`; `403 FORBIDDEN`; `404
+        ORDER_NOT_FOUND`; `409 INSUFFICIENT_FUNDS`, `409 ORDER_ALREADY_PAID`,
+        `409 ORDER_NOT_PAYABLE`, `409 CURRENCY_MISMATCH`, `409
+        IDEMPOTENCY_KEY_REUSED`, `409 IDEMPOTENCY_IN_PROGRESS`; `413
+        REQUEST_TOO_LARGE`; `415 UNSUPPORTED_MEDIA_TYPE`; `429 RATE_LIMITED`;
+        `500 INTERNAL_ERROR`; `503 IDENTITY_UNAVAILABLE`, `503
+        OPERATION_OUTCOME_UNKNOWN`, `503 SERVICE_UNAVAILABLE`.
+      servers:
+        - url: http://127.0.0.1:8083
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        $ref: '#/components/requestBodies/CreatePaymentRequest'
+      responses:
+        "201":
+          description: The payment was created or an identical completed request was replayed.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestID'
+            X-Content-Type-Options:
+              $ref: '#/components/headers/XContentTypeOptions'
+            Strict-Transport-Security:
+              $ref: '#/components/headers/StrictTransportSecurity'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+            Location:
+              $ref: '#/components/headers/Location'
+            Idempotency-Replayed:
+              $ref: '#/components/headers/IdempotencyReplayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentResponse'
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "401":
+          $ref: '#/components/responses/BearerUnauthorized'
+        "403":
+          $ref: '#/components/responses/Forbidden'
+        "404":
+          $ref: '#/components/responses/NotFound'
+        "409":
+          $ref: '#/components/responses/Conflict'
+        "413":
+          $ref: '#/components/responses/PayloadTooLarge'
+        "415":
+          $ref: '#/components/responses/UnsupportedMediaType'
+        "429":
+          $ref: '#/components/responses/TooManyRequests'
+        "500":
+          $ref: '#/components/responses/InternalServerError'
+        "503":
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/payments/{payment_id}:
+    parameters:
+      - $ref: '#/components/parameters/PaymentID'
+    get:
+      tags: [Payments]
+      operationId: getPayment
+      summary: Get a visible payment
+      description: |
+        Customers can read only their own payment. Admins can read any payment.
+        Cross-customer reads are deliberately reported as not found.
+
+        Error codes: `400 INVALID_PAYMENT_ID`; `401 UNAUTHORIZED`, `401
+        ACCOUNT_DISABLED`; `403 FORBIDDEN`; `404 PAYMENT_NOT_FOUND`; `429
+        RATE_LIMITED`; `500 INTERNAL_ERROR`; `503 IDENTITY_UNAVAILABLE`, `503
+        SERVICE_UNAVAILABLE`.
+      servers:
+        - url: http://127.0.0.1:8083
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Payment detail.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestID'
+            X-Content-Type-Options:
+              $ref: '#/components/headers/XContentTypeOptions'
+            Strict-Transport-Security:
+              $ref: '#/components/headers/StrictTransportSecurity'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentResponse'
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "401":
+          $ref: '#/components/responses/BearerUnauthorized'
+        "403":
+          $ref: '#/components/responses/Forbidden'
+        "404":
+          $ref: '#/components/responses/NotFound'
+        "429":
+          $ref: '#/components/responses/TooManyRequests'
+        "500":
+          $ref: '#/components/responses/InternalServerError'
+        "503":
+          $ref: '#/components/responses/ServiceUnavailable'
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: PASETO v4.local
+      description: |
+        One access token, no longer than 4,096 bytes, in exactly one
+        Authorization header. The scheme comparison is case-insensitive; the
+        token may not be empty or contain whitespace or commas.
+  parameters:
+    ProductID:
+      name: product_id
+      in: path
+      required: true
+      description: Canonical lowercase, hyphenated, non-nil product UUID.
+      schema:
+        $ref: '#/components/schemas/UUID'
+    OrderID:
+      name: order_id
+      in: path
+      required: true
+      description: Canonical lowercase, hyphenated, non-nil order UUID.
+      schema:
+        $ref: '#/components/schemas/UUID'
+    PaymentID:
+      name: payment_id
+      in: path
+      required: true
+      description: Canonical lowercase, hyphenated, non-nil payment UUID.
+      schema:
+        $ref: '#/components/schemas/UUID'
+    PageLimit:
+      name: limit
+      in: query
+      required: false
+      allowEmptyValue: false
+      description: Maximum number of results in this keyset page.
+      schema:
+        type: integer
+        format: int32
+        minimum: 1
+        maximum: 100
+        default: 20
+    PageCursor:
+      name: cursor
+      in: query
+      required: false
+      allowEmptyValue: false
+      description: |
+        Opaque canonical unpadded base64url keyset cursor. The decoded object is
+        exactly `{ "v": 1, "created_at": <UTC RFC3339Nano>, "id": <UUID> }`.
+        Empty, duplicate, non-canonical, padded, or oversized values are invalid.
+      schema:
+        $ref: '#/components/schemas/PageCursor'
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |
+        Exactly one case-insensitive HTTP header value. It is scoped by
+        principal and operation. The first byte must be ASCII alphanumeric; the
+        remaining bytes may also contain `.`, `_`, `:`, or `-`.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 128
+        pattern: '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'
+  headers:
+    XRequestID:
+      description: Caller-provided valid UUID or a server-generated UUID.
+      schema:
+        type: string
+        format: uuid
+    XContentTypeOptions:
+      description: Disables response MIME sniffing.
+      schema:
+        type: string
+        const: nosniff
+    StrictTransportSecurity:
+      description: Present only when the request used TLS.
+      schema:
+        type: string
+        const: max-age=31536000
+    CacheControlNoStore:
+      description: Prevents storage of authentication and protected-route data.
+      schema:
+        type: string
+        const: no-store
+    RetryAfter:
+      description: Whole seconds before retrying.
+      schema:
+        type: integer
+        minimum: 1
+    WWWAuthenticateBearer:
+      description: Bearer authentication challenge.
+      schema:
+        type: string
+        const: Bearer
+    Location:
+      description: Relative canonical path of the created resource.
+      schema:
+        type: string
+        pattern: '^/v1/(admin/products|orders|payments)/[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+    IdempotencyReplayed:
+      description: Present with literal `true` only for an idempotency replay.
+      schema:
+        type: string
+        const: "true"
+  requestBodies:
+    RegisterRequest:
+      required: true
+      description: Strict JSON object; encoded body limit is exactly 16,384 bytes.
+      x-maximum-body-bytes: 16384
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/RegisterRequest'
+    LoginRequest:
+      required: true
+      description: Strict JSON object; encoded body limit is exactly 16,384 bytes.
+      x-maximum-body-bytes: 16384
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/LoginRequest'
+    RefreshRequest:
+      required: true
+      description: Strict JSON object; encoded body limit is exactly 16,384 bytes.
+      x-maximum-body-bytes: 16384
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/RefreshRequest'
+    LogoutRequest:
+      required: true
+      description: Strict JSON object; encoded body limit is exactly 16,384 bytes.
+      x-maximum-body-bytes: 16384
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/LogoutRequest'
+    CreateProductRequest:
+      required: true
+      description: Strict JSON object; encoded body limit is exactly 16,384 bytes.
+      x-maximum-body-bytes: 16384
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/CreateProductRequest'
+    UpdateProductRequest:
+      required: true
+      description: Strict JSON object; encoded body limit is exactly 16,384 bytes.
+      x-maximum-body-bytes: 16384
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/UpdateProductRequest'
+    AdjustInventoryRequest:
+      required: true
+      description: Strict JSON object; encoded body limit is exactly 16,384 bytes.
+      x-maximum-body-bytes: 16384
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/AdjustInventoryRequest'
+    CreateOrderRequest:
+      required: true
+      description: Strict JSON object; encoded body limit is exactly 16,384 bytes.
+      x-maximum-body-bytes: 16384
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/CreateOrderRequest'
+    CreatePaymentRequest:
+      required: true
+      description: Strict JSON object; encoded body limit is exactly 16,384 bytes.
+      x-maximum-body-bytes: 16384
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/CreatePaymentRequest'
+  responses:
+    BadRequest:
+      description: The path, query, header, or request body is invalid.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestID'
+        X-Content-Type-Options:
+          $ref: '#/components/headers/XContentTypeOptions'
+        Strict-Transport-Security:
+          $ref: '#/components/headers/StrictTransportSecurity'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    AuthUnauthorized:
+      description: Authentication credentials or refresh token are invalid.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestID'
+        X-Content-Type-Options:
+          $ref: '#/components/headers/XContentTypeOptions'
+        Strict-Transport-Security:
+          $ref: '#/components/headers/StrictTransportSecurity'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControlNoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    BearerUnauthorized:
+      description: Bearer authentication failed or the account is disabled.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestID'
+        X-Content-Type-Options:
+          $ref: '#/components/headers/XContentTypeOptions'
+        Strict-Transport-Security:
+          $ref: '#/components/headers/StrictTransportSecurity'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControlNoStore'
+        WWW-Authenticate:
+          $ref: '#/components/headers/WWWAuthenticateBearer'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    Forbidden:
+      description: The authenticated role is not permitted.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestID'
+        X-Content-Type-Options:
+          $ref: '#/components/headers/XContentTypeOptions'
+        Strict-Transport-Security:
+          $ref: '#/components/headers/StrictTransportSecurity'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControlNoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    NotFound:
+      description: The resource does not exist or is not visible to the principal.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestID'
+        X-Content-Type-Options:
+          $ref: '#/components/headers/XContentTypeOptions'
+        Strict-Transport-Security:
+          $ref: '#/components/headers/StrictTransportSecurity'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    Conflict:
+      description: Current resource, inventory, funds, or idempotency state prevents the operation.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestID'
+        X-Content-Type-Options:
+          $ref: '#/components/headers/XContentTypeOptions'
+        Strict-Transport-Security:
+          $ref: '#/components/headers/StrictTransportSecurity'
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    PayloadTooLarge:
+      description: The encoded JSON body exceeds exactly 16,384 bytes.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestID'
+        X-Content-Type-Options:
+          $ref: '#/components/headers/XContentTypeOptions'
+        Strict-Transport-Security:
+          $ref: '#/components/headers/StrictTransportSecurity'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    UnsupportedMediaType:
+      description: Content-Type does not resolve to application/json.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestID'
+        X-Content-Type-Options:
+          $ref: '#/components/headers/XContentTypeOptions'
+        Strict-Transport-Security:
+          $ref: '#/components/headers/StrictTransportSecurity'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    UnprocessableEntity:
+      description: The valid order request would exceed signed 64-bit amount bounds.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestID'
+        X-Content-Type-Options:
+          $ref: '#/components/headers/XContentTypeOptions'
+        Strict-Transport-Security:
+          $ref: '#/components/headers/StrictTransportSecurity'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    TooManyRequests:
+      description: The applicable token bucket rejected the request.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestID'
+        X-Content-Type-Options:
+          $ref: '#/components/headers/XContentTypeOptions'
+        Strict-Transport-Security:
+          $ref: '#/components/headers/StrictTransportSecurity'
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    InternalServerError:
+      description: An unexpected internal failure occurred.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestID'
+        X-Content-Type-Options:
+          $ref: '#/components/headers/XContentTypeOptions'
+        Strict-Transport-Security:
+          $ref: '#/components/headers/StrictTransportSecurity'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    ServiceUnavailable:
+      description: Identity verification, persistence, or transaction outcome resolution is temporarily unavailable.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestID'
+        X-Content-Type-Options:
+          $ref: '#/components/headers/XContentTypeOptions'
+        Strict-Transport-Security:
+          $ref: '#/components/headers/StrictTransportSecurity'
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+  schemas:
+    UUID:
+      type: string
+      format: uuid
+      pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+      not:
+        const: 00000000-0000-0000-0000-000000000000
+    Timestamp:
+      type: string
+      format: date-time
+    Currency:
+      type: string
+      pattern: '^[A-Z]{3}$'
+      minLength: 3
+      maxLength: 3
+    Role:
+      type: string
+      enum: [customer, admin]
+    ProductStatus:
+      type: string
+      enum: [active, inactive]
+    OrderStatus:
+      type: string
+      enum: [pending, paid, payment_failed, cancelled]
+    PaymentStatus:
+      type: string
+      const: succeeded
+    Availability:
+      type: string
+      enum: [in_stock, out_of_stock]
+    Email:
+      type: string
+      format: email
+      minLength: 3
+      maxLength: 254
+      description: Server trims surrounding Unicode whitespace and lowercases before validating 3-254 UTF-8 bytes.
+    Password:
+      type: string
+      format: password
+      minLength: 12
+      maxLength: 128
+      writeOnly: true
+      description: The implementation measures 12-128 UTF-8 bytes, not JSON Schema characters.
+      x-byte-min-length: 12
+      x-byte-max-length: 128
+    DisplayName:
+      type: string
+      minLength: 1
+      maxLength: 100
+      description: Server trims surrounding Unicode whitespace before measuring Unicode code points.
+    RefreshToken:
+      type: string
+      minLength: 1
+      maxLength: 128
+      writeOnly: true
+    RegisterRequest:
+      type: object
+      additionalProperties: false
+      required: [email, password, display_name]
+      properties:
+        email:
+          $ref: '#/components/schemas/Email'
+        password:
+          $ref: '#/components/schemas/Password'
+        display_name:
+          $ref: '#/components/schemas/DisplayName'
+    LoginRequest:
+      type: object
+      additionalProperties: false
+      required: [email, password]
+      properties:
+        email:
+          $ref: '#/components/schemas/Email'
+        password:
+          $ref: '#/components/schemas/Password'
+    RefreshRequest:
+      type: object
+      additionalProperties: false
+      required: [refresh_token]
+      properties:
+        refresh_token:
+          $ref: '#/components/schemas/RefreshToken'
+    LogoutRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        refresh_token:
+          oneOf:
+            - type: string
+            - type: "null"
+      description: Any missing, null, or invalid token remains an idempotent 204 success.
+    User:
+      type: object
+      additionalProperties: false
+      required: [id, email, display_name, role, created_at, updated_at]
+      properties:
+        id:
+          $ref: '#/components/schemas/UUID'
+        email:
+          type: string
+          format: email
+          minLength: 3
+          maxLength: 254
+        display_name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        role:
+          $ref: '#/components/schemas/Role'
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+        updated_at:
+          $ref: '#/components/schemas/Timestamp'
+    Account:
+      type: object
+      additionalProperties: false
+      required: [id, currency, balance, created_at, updated_at]
+      properties:
+        id:
+          $ref: '#/components/schemas/UUID'
+        currency:
+          $ref: '#/components/schemas/Currency'
+        balance:
+          type: integer
+          format: int64
+          minimum: 0
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+        updated_at:
+          $ref: '#/components/schemas/Timestamp'
+    TokenPair:
+      type: object
+      additionalProperties: false
+      required: [access_token, refresh_token, token_type, access_expires_at, refresh_expires_at]
+      properties:
+        access_token:
+          type: string
+          minLength: 1
+          maxLength: 4096
+          readOnly: true
+        refresh_token:
+          type: string
+          minLength: 1
+          maxLength: 128
+          readOnly: true
+        token_type:
+          type: string
+          const: Bearer
+        access_expires_at:
+          $ref: '#/components/schemas/Timestamp'
+        refresh_expires_at:
+          $ref: '#/components/schemas/Timestamp'
+    AuthResponse:
+      type: object
+      additionalProperties: false
+      required: [user, account, tokens]
+      properties:
+        user:
+          $ref: '#/components/schemas/User'
+        account:
+          $ref: '#/components/schemas/Account'
+        tokens:
+          $ref: '#/components/schemas/TokenPair'
+    ProfileResponse:
+      type: object
+      additionalProperties: false
+      required: [user, account]
+      properties:
+        user:
+          $ref: '#/components/schemas/User'
+        account:
+          $ref: '#/components/schemas/Account'
+    SKU:
+      type: string
+      minLength: 3
+      maxLength: 64
+      pattern: '^[A-Z0-9][A-Z0-9._-]{2,63}$'
+      description: Server trims and uppercases before applying this canonical pattern.
+    ProductName:
+      type: string
+      minLength: 1
+      maxLength: 200
+      description: Server trims surrounding Unicode whitespace before measuring code points.
+    ProductDescription:
+      type: string
+      maxLength: 2000
+      description: Server trims surrounding Unicode whitespace before measuring code points.
+    PriceAmount:
+      type: integer
+      format: int64
+      minimum: 1
+      maximum: 1000000000000
+      description: Minor currency units.
+    Version:
+      type: integer
+      format: int64
+      minimum: 1
+    InventoryQuantity:
+      type: integer
+      format: int64
+      minimum: 0
+      maximum: 1000000000
+    CreateProductRequest:
+      type: object
+      additionalProperties: false
+      required: [sku, name, price_amount, currency, status]
+      properties:
+        sku:
+          $ref: '#/components/schemas/SKU'
+        name:
+          $ref: '#/components/schemas/ProductName'
+        description:
+          oneOf:
+            - $ref: '#/components/schemas/ProductDescription'
+            - type: "null"
+        price_amount:
+          $ref: '#/components/schemas/PriceAmount'
+        currency:
+          type: string
+          const: USD
+          description: Server trims and uppercases before requiring USD.
+        status:
+          $ref: '#/components/schemas/ProductStatus'
+        initial_quantity:
+          oneOf:
+            - $ref: '#/components/schemas/InventoryQuantity'
+            - type: "null"
+    UpdateProductRequest:
+      type: object
+      additionalProperties: false
+      required: [expected_version]
+      properties:
+        expected_version:
+          $ref: '#/components/schemas/Version'
+        name:
+          oneOf:
+            - $ref: '#/components/schemas/ProductName'
+            - type: "null"
+        description:
+          oneOf:
+            - $ref: '#/components/schemas/ProductDescription'
+            - type: "null"
+        price_amount:
+          oneOf:
+            - $ref: '#/components/schemas/PriceAmount'
+            - type: "null"
+        status:
+          oneOf:
+            - $ref: '#/components/schemas/ProductStatus'
+            - type: "null"
+      anyOf:
+        - required: [name]
+          properties:
+            name:
+              $ref: '#/components/schemas/ProductName'
+        - required: [description]
+          properties:
+            description:
+              $ref: '#/components/schemas/ProductDescription'
+        - required: [price_amount]
+          properties:
+            price_amount:
+              $ref: '#/components/schemas/PriceAmount'
+        - required: [status]
+          properties:
+            status:
+              $ref: '#/components/schemas/ProductStatus'
+    Product:
+      type: object
+      additionalProperties: false
+      required: [id, sku, name, description, price_amount, currency, version, availability, created_at, updated_at]
+      properties:
+        id:
+          $ref: '#/components/schemas/UUID'
+        sku:
+          $ref: '#/components/schemas/SKU'
+        name:
+          $ref: '#/components/schemas/ProductName'
+        description:
+          $ref: '#/components/schemas/ProductDescription'
+        price_amount:
+          $ref: '#/components/schemas/PriceAmount'
+        currency:
+          $ref: '#/components/schemas/Currency'
+        version:
+          $ref: '#/components/schemas/Version'
+        availability:
+          $ref: '#/components/schemas/Availability'
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+        updated_at:
+          $ref: '#/components/schemas/Timestamp'
+    AdminProduct:
+      type: object
+      additionalProperties: false
+      required: [id, sku, name, description, price_amount, currency, version, availability, created_at, updated_at, status]
+      properties:
+        id:
+          $ref: '#/components/schemas/UUID'
+        sku:
+          $ref: '#/components/schemas/SKU'
+        name:
+          $ref: '#/components/schemas/ProductName'
+        description:
+          $ref: '#/components/schemas/ProductDescription'
+        price_amount:
+          $ref: '#/components/schemas/PriceAmount'
+        currency:
+          $ref: '#/components/schemas/Currency'
+        version:
+          $ref: '#/components/schemas/Version'
+        availability:
+          $ref: '#/components/schemas/Availability'
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+        updated_at:
+          $ref: '#/components/schemas/Timestamp'
+        status:
+          $ref: '#/components/schemas/ProductStatus'
+    Inventory:
+      type: object
+      additionalProperties: false
+      required: [product_id, sku, name, status, quantity, version, updated_at]
+      properties:
+        product_id:
+          $ref: '#/components/schemas/UUID'
+        sku:
+          $ref: '#/components/schemas/SKU'
+        name:
+          $ref: '#/components/schemas/ProductName'
+        status:
+          $ref: '#/components/schemas/ProductStatus'
+        quantity:
+          $ref: '#/components/schemas/InventoryQuantity'
+        version:
+          $ref: '#/components/schemas/Version'
+        updated_at:
+          $ref: '#/components/schemas/Timestamp'
+    AdjustInventoryRequest:
+      type: object
+      additionalProperties: false
+      required: [expected_version, delta]
+      properties:
+        expected_version:
+          $ref: '#/components/schemas/Version'
+        delta:
+          type: integer
+          format: int64
+          oneOf:
+            - minimum: -1000000000
+              maximum: -1
+            - minimum: 1
+              maximum: 1000000000
+    PageCursor:
+      type: string
+      minLength: 1
+      maxLength: 512
+      pattern: '^[A-Za-z0-9_-]+$'
+    Pagination:
+      type: object
+      additionalProperties: false
+      required: [limit, next_cursor]
+      properties:
+        limit:
+          type: integer
+          format: int32
+          minimum: 1
+          maximum: 100
+        next_cursor:
+          oneOf:
+            - $ref: '#/components/schemas/PageCursor'
+            - type: "null"
+    ProductResponse:
+      type: object
+      additionalProperties: false
+      required: [product]
+      properties:
+        product:
+          $ref: '#/components/schemas/Product'
+    ProductPageResponse:
+      type: object
+      additionalProperties: false
+      required: [products, pagination]
+      properties:
+        products:
+          type: array
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/Product'
+        pagination:
+          $ref: '#/components/schemas/Pagination'
+    AdminProductResponse:
+      type: object
+      additionalProperties: false
+      required: [product, inventory]
+      properties:
+        product:
+          $ref: '#/components/schemas/AdminProduct'
+        inventory:
+          $ref: '#/components/schemas/Inventory'
+    InventoryResponse:
+      type: object
+      additionalProperties: false
+      required: [inventory]
+      properties:
+        inventory:
+          $ref: '#/components/schemas/Inventory'
+    InventoryPageResponse:
+      type: object
+      additionalProperties: false
+      required: [inventory, pagination]
+      properties:
+        inventory:
+          type: array
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/Inventory'
+        pagination:
+          $ref: '#/components/schemas/Pagination'
+    CreateOrderItem:
+      type: object
+      additionalProperties: false
+      required: [product_id, quantity, expected_product_version]
+      properties:
+        product_id:
+          $ref: '#/components/schemas/UUID'
+        quantity:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 1000
+        expected_product_version:
+          $ref: '#/components/schemas/Version'
+    CreateOrderRequest:
+      type: object
+      additionalProperties: false
+      required: [items]
+      properties:
+        items:
+          type: array
+          minItems: 1
+          maxItems: 50
+          items:
+            $ref: '#/components/schemas/CreateOrderItem'
+          description: Product IDs must be unique; JSON Schema cannot express uniqueness by one object property.
+    OrderItem:
+      type: object
+      additionalProperties: false
+      required: [id, product_id, sku, name, product_version, quantity, unit_price_amount, line_amount]
+      properties:
+        id:
+          $ref: '#/components/schemas/UUID'
+        product_id:
+          $ref: '#/components/schemas/UUID'
+        sku:
+          $ref: '#/components/schemas/SKU'
+        name:
+          $ref: '#/components/schemas/ProductName'
+        product_version:
+          $ref: '#/components/schemas/Version'
+        quantity:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 1000
+        unit_price_amount:
+          $ref: '#/components/schemas/PriceAmount'
+        line_amount:
+          type: integer
+          format: int64
+          minimum: 1
+    Order:
+      type: object
+      additionalProperties: false
+      required: [id, user_id, status, currency, total_amount, items, created_at, updated_at]
+      properties:
+        id:
+          $ref: '#/components/schemas/UUID'
+        user_id:
+          $ref: '#/components/schemas/UUID'
+        status:
+          $ref: '#/components/schemas/OrderStatus'
+        currency:
+          $ref: '#/components/schemas/Currency'
+        total_amount:
+          type: integer
+          format: int64
+          minimum: 1
+        items:
+          type: array
+          minItems: 1
+          maxItems: 50
+          items:
+            $ref: '#/components/schemas/OrderItem'
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+        updated_at:
+          $ref: '#/components/schemas/Timestamp'
+    OrderResponse:
+      type: object
+      additionalProperties: false
+      required: [order]
+      properties:
+        order:
+          $ref: '#/components/schemas/Order'
+    OrderPageResponse:
+      type: object
+      additionalProperties: false
+      required: [orders, pagination]
+      properties:
+        orders:
+          type: array
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/Order'
+        pagination:
+          $ref: '#/components/schemas/Pagination'
+    CreatePaymentRequest:
+      type: object
+      additionalProperties: false
+      required: [order_id]
+      properties:
+        order_id:
+          $ref: '#/components/schemas/UUID'
+    Payment:
+      type: object
+      additionalProperties: false
+      required: [id, order_id, user_id, status, currency, amount, created_at]
+      properties:
+        id:
+          $ref: '#/components/schemas/UUID'
+        order_id:
+          $ref: '#/components/schemas/UUID'
+        user_id:
+          $ref: '#/components/schemas/UUID'
+        status:
+          $ref: '#/components/schemas/PaymentStatus'
+        currency:
+          $ref: '#/components/schemas/Currency'
+        amount:
+          type: integer
+          format: int64
+          minimum: 1
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+    PaymentResponse:
+      type: object
+      additionalProperties: false
+      required: [payment]
+      properties:
+        payment:
+          $ref: '#/components/schemas/Payment'
+    LivenessProbe:
+      type: object
+      additionalProperties: false
+      required: [status, service]
+      properties:
+        status:
+          type: string
+          const: ok
+        service:
+          type: string
+          enum: [user-service, order-service, payment-service]
+    ReadinessProbe:
+      type: object
+      additionalProperties: false
+      required: [status, service, checks]
+      properties:
+        status:
+          type: string
+          enum: [ready, not_ready]
+        service:
+          type: string
+          enum: [user-service, order-service, payment-service]
+        checks:
+          type: object
+          minProperties: 1
+          additionalProperties:
+            type: string
+            enum: [up, down]
+    ErrorCode:
+      type: string
+      enum:
+        - ACCOUNT_DISABLED
+        - CURRENCY_MISMATCH
+        - EMAIL_ALREADY_EXISTS
+        - EMPTY_PRODUCT_UPDATE
+        - FORBIDDEN
+        - IDEMPOTENCY_IN_PROGRESS
+        - IDEMPOTENCY_KEY_REQUIRED
+        - IDEMPOTENCY_KEY_REUSED
+        - IDENTITY_UNAVAILABLE
+        - INSUFFICIENT_FUNDS
+        - INSUFFICIENT_INVENTORY
+        - INTERNAL_ERROR
+        - INVALID_CREDENTIALS
+        - INVALID_CURSOR
+        - INVALID_CURRENCY
+        - INVALID_DESCRIPTION
+        - INVALID_DISPLAY_NAME
+        - INVALID_EMAIL
+        - INVALID_EXPECTED_VERSION
+        - INVALID_IDEMPOTENCY_KEY
+        - INVALID_INITIAL_QUANTITY
+        - INVALID_INVENTORY_DELTA
+        - INVALID_ITEM_QUANTITY
+        - INVALID_ORDER_ID
+        - INVALID_ORDER_ITEMS
+        - INVALID_PASSWORD
+        - INVALID_PAYMENT_ID
+        - INVALID_PRICE
+        - INVALID_PRODUCT_ID
+        - INVALID_PRODUCT_NAME
+        - INVALID_PRODUCT_STATUS
+        - INVALID_QUERY
+        - INVALID_REFRESH_TOKEN
+        - INVALID_REQUEST
+        - INVALID_SKU
+        - INVENTORY_OUT_OF_RANGE
+        - INVENTORY_VERSION_CONFLICT
+        - METHOD_NOT_ALLOWED
+        - OPERATION_OUTCOME_UNKNOWN
+        - ORDER_ALREADY_PAID
+        - ORDER_AMOUNT_TOO_LARGE
+        - ORDER_NOT_FOUND
+        - ORDER_NOT_PAYABLE
+        - PAYMENT_NOT_FOUND
+        - PRODUCT_CHANGED
+        - PRODUCT_NOT_FOUND
+        - PRODUCT_UNAVAILABLE
+        - PRODUCT_VERSION_CONFLICT
+        - RATE_LIMITED
+        - REQUEST_TOO_LARGE
+        - ROUTE_NOT_FOUND
+        - SERVICE_UNAVAILABLE
+        - SKU_ALREADY_EXISTS
+        - UNAUTHORIZED
+        - UNSUPPORTED_MEDIA_TYPE
+        - USER_NOT_FOUND
+    Error:
+      type: object
+      additionalProperties: false
+      required: [code, message, request_id]
+      properties:
+        code:
+          $ref: '#/components/schemas/ErrorCode'
+        message:
+          type: string
+          minLength: 1
+        request_id:
+          type: string
+          format: uuid
+    ErrorEnvelope:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error:
+          $ref: '#/components/schemas/Error'

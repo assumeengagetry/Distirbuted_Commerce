@@ -1,0 +1,80 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: commerce
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress"]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: user-ingress
+  namespace: commerce
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: distributed-commerce
+      app.kubernetes.io/component: user
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              commerce.network/ingress: "true"
+      ports:
+        - protocol: TCP
+          port: 8081
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: distributed-commerce
+              app.kubernetes.io/component: order
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: distributed-commerce
+              app.kubernetes.io/component: payment
+      ports:
+        - protocol: TCP
+          port: 9091
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: order-ingress
+  namespace: commerce
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: distributed-commerce
+      app.kubernetes.io/component: order
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              commerce.network/ingress: "true"
+      ports:
+        - protocol: TCP
+          port: 8082
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: payment-ingress
+  namespace: commerce
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: distributed-commerce
+      app.kubernetes.io/component: payment
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              commerce.network/ingress: "true"
+      ports:
+        - protocol: TCP
+          port: 8083

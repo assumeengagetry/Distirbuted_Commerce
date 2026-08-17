@@ -1,0 +1,20 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+images:
+  - name: distributed-commerce/user-service
+    newName: registry.example.invalid/distributed-commerce/user-service
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+  - name: distributed-commerce/order-service
+    newName: registry.example.invalid/distributed-commerce/order-service
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+  - name: distributed-commerce/payment-service
+    newName: registry.example.invalid/distributed-commerce/payment-service
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+  - name: distributed-commerce/job-worker
+    newName: registry.example.invalid/distributed-commerce/job-worker
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+  - name: distributed-commerce/migrator
+    newName: registry.example.invalid/distributed-commerce/migrator
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000

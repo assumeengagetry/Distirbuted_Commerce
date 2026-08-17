@@ -1,0 +1,27 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: commerce-user
+  namespace: commerce
+data:
+  SERVICE_NAME: user-service
+  HTTP_ADDR: 0.0.0.0:8081
+  HTTP_TLS_CERT_FILE: /var/run/secrets/http/tls.crt
+  HTTP_TLS_KEY_FILE: /var/run/secrets/http/tls.key
+  GRPC_ADDR: 0.0.0.0:9091
+  GRPC_REQUEST_TIMEOUT: 2s
+  GRPC_SHUTDOWN_TIMEOUT: 10s
+  GRPC_TLS_CERT_FILE: /var/run/secrets/grpc/tls.crt
+  GRPC_TLS_KEY_FILE: /var/run/secrets/grpc/tls.key
+  GRPC_TLS_CA_FILE: /var/run/secrets/identity-ca/ca.crt
+  GRPC_TLS_ALLOWED_CLIENT_URIS: spiffe://commerce.internal/order-service,spiffe://commerce.internal/payment-service
+  METRICS_ADDR: 127.0.0.1:9101
+  QUEUE_REDIS_ADDR: redis-queue.example.invalid:6380
+  QUEUE_REDIS_USERNAME: commerce
+  QUEUE_REDIS_DB: "0"
+  QUEUE_REDIS_TLS_CA_FILE: /var/run/secrets/redis/ca.crt
+  QUEUE_REDIS_TLS_SERVER_NAME: redis-queue.example.invalid
+  JOB_QUEUE: maintenance
+  JOB_ENQUEUE_TIMEOUT: 250ms
+  JOB_TASK_TIMEOUT: 10s
+  JOB_UNIQUE_TTL: 1m

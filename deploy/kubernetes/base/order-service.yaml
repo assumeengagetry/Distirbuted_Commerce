@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: commerce-order
+  namespace: commerce
+  labels:
+    app.kubernetes.io/name: distributed-commerce
+    app.kubernetes.io/component: order
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: distributed-commerce
+    app.kubernetes.io/component: order
+  ports:
+    - name: https
+      port: 443
+      targetPort: https
+      protocol: TCP
+      appProtocol: https

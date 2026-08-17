@@ -1,6 +1,6 @@
 # Distributed Commerce Platform
 
-A production-oriented Go microservice portfolio project built incrementally around transactional commerce workflows. The repository currently implements **Phase 7**: the service foundation, transactional commerce workflows, centralized gRPC identity, Redis caching, retrying Asynq jobs, Prometheus metrics, and OpenTelemetry traces.
+A production-oriented Go microservice portfolio project built incrementally around transactional commerce workflows. The repository currently implements **Phase 8**: the service foundation, transactional commerce workflows, centralized gRPC identity, Redis caching, retrying Asynq jobs, Prometheus metrics, OpenTelemetry traces, production OCI images, Kubernetes manifests, an OpenAPI contract, CI gates, and reproducible benchmark entry points.
 
 External payment providers, refunds, cancellation/restock workflows, transactional outbox delivery, hosted observability backends, dashboards, and alerting are intentionally not claimed as implemented yet.
 
@@ -44,6 +44,11 @@ Implemented:
 - Per-process Prometheus registries with isolated loopback-only `/metrics` listeners
 - Explicit OpenTelemetry instrumentation for Gin, gRPC, pgx, Redis, and Asynq with optional OTLP/gRPC export
 - Trace-context propagation across HTTP, identity RPC, database/cache calls, and delayed jobs plus log correlation
+- Digest-pinned static OCI images for API services, worker, admin CLI, and embedded migration runner
+- Kustomize base/production deployment contract with non-root security contexts, probes, PDBs, and migration Job
+- OpenAPI 3.1 HTTP contract validated against the concrete route set
+- GitHub Actions quality, integration, image, vulnerability, and informational benchmark jobs
+- Architecture, operations, and threat-oriented security documentation under `docs/`
 - PostgreSQL-backed readiness, process liveness, and signal-aware graceful shutdown
 - Rootless PostgreSQL and Redis infrastructure using Podman Quadlet and systemd user units
 - Unit, HTTP, race, and real PostgreSQL/Redis integration tests
@@ -106,6 +111,8 @@ Gin and gRPC remain transport adapters around typed boundaries. The three API pr
 ├── cmd/payment-service/       # Account debit/payment process composition
 ├── cmd/job-worker/            # Asynq maintenance worker composition
 ├── cmd/job-admin/             # Restricted archived-task operations
+├── cmd/migrator/              # One-shot embedded migration runner
+├── cmd/loopback-probe/        # Minimal worker container probe
 ├── internal/auth/             # Argon2id, PASETO, refresh tokens, principal context
 ├── internal/user/             # Models, business rules, service, repository boundary
 ├── internal/order/            # Catalog, inventory, order rules and repository boundary
@@ -123,9 +130,14 @@ Gin and gRPC remain transport adapters around typed boundaries. The three API pr
 ├── internal/transport/grpc/   # Handwritten identity gRPC adapter
 ├── internal/transport/http/   # Gin handlers and middleware
 ├── api/proto/identity/v1/     # Versioned identity service contract
+├── api/openapi/               # Validated HTTP API contract
 ├── db/migrations/             # Ordered up/down migrations
 ├── db/query/                  # Reviewed SQL consumed by sqlc
 ├── deploy/quadlet/            # Rootless Podman systemd units
+├── deploy/kubernetes/         # Kustomize production deployment contract
+├── docs/                      # Architecture, operations, and security runbooks
+├── Containerfile              # Reproducible static OCI image build
+├── .github/workflows/         # CI and artifact pipeline
 ├── scripts/                   # Local secrets, generated-code checks, test DB safety
 ├── Makefile
 ├── buf.yaml
@@ -137,7 +149,7 @@ Gin and gRPC remain transport adapters around typed boundaries. The three API pr
 
 | Area | Technology |
 | --- | --- |
-| Language | Go 1.26.5 |
+| Language | Go 1.26.6 |
 | HTTP | Gin 1.12 |
 | RPC | gRPC-Go 1.83 |
 | Contracts | Protocol Buffers 3, Buf 1.72 |
@@ -267,6 +279,24 @@ Metrics include Go/process health, HTTP and gRPC request rates/durations/statuse
 Trace export is disabled by default. Setting `OTEL_TRACES_EXPORTER=otlp` and an HTTP(S) `OTEL_EXPORTER_OTLP_ENDPOINT` enables a bounded batch exporter to an external OpenTelemetry Collector. Production requires HTTPS; local plaintext collectors must be loopback. Public Gin listeners intentionally start local roots instead of trusting client-supplied trace IDs or sampling flags. W3C Trace Context then propagates across internal gRPC and Asynq boundaries; baggage is never forwarded. Request-triggered Asynq producers inject trace headers without changing the deterministic task payload or uniqueness key; periodic tasks start root consumer traces, and retries create sibling processing spans. `slog` records created with an active span automatically include `trace_id` and `span_id`, including local unsampled IDs when export is disabled.
 
 Instrumentation receives explicit providers from each composition root; no process-global OTel provider is mutated. Metric labels are limited to protocol routes/methods/statuses, fixed task/cache outcomes, and static service resource attributes. UUIDs, IPs, emails, SKUs, idempotency keys, Redis keys, task payloads, SQL text/parameters, bearer values, and DSNs are not custom metric labels. The repository provides exporters and instrumentation, not a bundled Prometheus server, Collector storage, dashboards, or alert rules.
+
+## Phase 8 Delivery
+
+The externally visible HTTP contract is [OpenAPI 3.1](api/openapi/commerce.yaml); `make openapi-check` validates it and checks that its paths match the three concrete routers. Production images are built with the digest-pinned [Containerfile](Containerfile) and run as UID/GID `65532` from a scratch runtime. Kubernetes resources are rendered from [deploy/kubernetes/overlays/production](deploy/kubernetes/overlays/production/); PostgreSQL, Redis, the ingress/Gateway, certificate issuer, Prometheus storage, and OTel Collector remain external dependencies. The overlay intentionally contains zero image digests and no Secret resources until an environment supplies approved values.
+
+Phase 8 engineering gates are:
+
+```bash
+make openapi-check
+make kube-check
+make workflow-check
+make image SERVICE=user-service IMAGE_VERSION="$GIT_SHA"
+make images IMAGE_PREFIX=registry.example.com/distributed-commerce IMAGE_VERSION="$GIT_SHA"
+make benchmark BENCHTIME=1s COUNT=5
+make release-check
+```
+
+`make benchmark` records parsing, validation, hashing, and cache-decoding costs only. Shared CI runner results are informational and are not service capacity claims. Read [docs/architecture.md](docs/architecture.md), [docs/operations.md](docs/operations.md), and [docs/security.md](docs/security.md) before production deployment.
 
 ## Database Schema
 
@@ -506,7 +536,7 @@ Users have `customer` or `admin` roles. Self-registration always creates a `cust
 
 ### Prerequisites
 
-- Go 1.26.5 or newer
+- Go 1.26.6 or newer
 - Podman 5.7 or newer with Quadlet support
 - PostgreSQL client tools (`psql`, `createdb`, and `dropdb`)
 - OpenSSL
@@ -710,7 +740,7 @@ Coverage includes:
 - Pinned protobuf/sqlc generation, module tidiness, race/vet/build checks, and reachable-vulnerability scanning
 - Empty-database migration up/down/up validation and serialized cross-package PostgreSQL integration tests
 
-CI and benchmark reporting are Phase 8 work. No performance data is invented.
+CI and benchmark artifacts are reproducible inputs for release review; no performance data is invented.
 
 ## Design Decisions
 
@@ -772,7 +802,7 @@ CI and benchmark reporting are Phase 8 work. No performance data is invented.
 5. **Phase 5 complete:** versioned identity protobuf, deadline-bound gRPC auth, mTLS, health, and coordinated lifecycle.
 6. **Phase 6 complete:** fail-open Redis product cache, generation-fenced invalidation, Asynq maintenance jobs, retries, archive handling, and recovery tooling.
 7. **Phase 7 complete:** isolated Prometheus endpoints, explicit OTel providers, OTLP traces, cross-HTTP/gRPC/database/cache/job propagation, and correlated logs.
-8. **Phase 8:** production images, Kubernetes, OpenAPI, CI, benchmarks, and final portfolio documentation.
+8. **Phase 8 complete:** production images, Kubernetes, OpenAPI, CI, benchmarks, and final portfolio documentation.
 
 ## Known Limitations
 
@@ -791,3 +821,4 @@ CI and benchmark reporting are Phase 8 work. No performance data is invented.
 - The local PostgreSQL bootstrap role owns the development database; separate production migrator/runtime roles arrive with production deployment work.
 - A fresh database has no administrator bootstrap or customer funding command, so the documented HTTP examples alone cannot complete an admin-create-to-payment walkthrough.
 - Prometheus storage, the OpenTelemetry Collector, dashboards, SLOs, and alert routing are external deployment concerns and are not bundled in this repository.
+- Registry signing, SBOM generation, image admission, and environment-specific NetworkPolicy CIDRs remain release-platform responsibilities; the CI image job only builds, inspects, and archives images.

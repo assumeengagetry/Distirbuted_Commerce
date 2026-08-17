@@ -1,0 +1,189 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 4 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GOTOOLCHAIN: local
+
+jobs:
+  quality:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+      - name: Validate contracts and static analysis
+        run: make proto-check openapi-check kube-check workflow-check fmt-check vet sqlc-vet mod-check
+      - name: Run tests with coverage
+        run: |
+          install -d artifacts
+          go test -count=1 -covermode=atomic -coverprofile=artifacts/coverage.out ./...
+      - name: Run race detector
+        run: go test -race -count=1 ./...
+      - name: Build binaries and checksums
+        run: |
+          make build
+          sha256sum bin/user-service bin/order-service bin/payment-service bin/job-worker bin/job-admin bin/migrator bin/loopback-probe > artifacts/checksums.txt
+      - name: Scan reachable vulnerabilities
+        run: make vulncheck
+      - name: Upload quality artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: quality-${{ github.sha }}
+          path: artifacts
+          if-no-files-found: error
+          retention-days: 14
+
+  integration:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: public.ecr.aws/docker/library/postgres:17-alpine@sha256:af194ccf3e2d7fe367012c7b88ce8b816c5c889b18a5b316799a1f0d7eac746a
+        env:
+          POSTGRES_DB: commerce
+          POSTGRES_USER: commerce
+          POSTGRES_PASSWORD: ci-postgres-only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U commerce -d commerce"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+      redis:
+        image: public.ecr.aws/docker/library/redis:7.4-alpine@sha256:9702d01c1f10c3ea9f48211b4362e44f154ff02d063e6f7268eba804059f53bf
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+      - name: Install PostgreSQL client
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends postgresql-client
+      - name: Configure disposable integration environment
+        env:
+          REDIS_CONTAINER: ${{ job.services.redis.id }}
+        run: |
+          docker exec "$REDIS_CONTAINER" redis-cli ACL SETUSER commerce on '>ci-redis-only' '~*' '&*' '+@all'
+          install -d -m 700 .secrets artifacts
+          printf '%s' 'ci-redis-only' > .secrets/redis_password
+          printf '%s\n' '127.0.0.1:5432:*:commerce:ci-postgres-only' > .secrets/pgpass
+          printf '%s\n' \
+            'APP_ENV=test' \
+            'DATABASE_URL=postgres://commerce@127.0.0.1:5432/commerce?sslmode=disable' \
+            'TEST_DATABASE_URL=postgres://commerce@127.0.0.1:5432/commerce_test?sslmode=disable' \
+            'TEST_REDIS_ADDR=127.0.0.1:6379' \
+            'TEST_REDIS_USERNAME=commerce' \
+            'TEST_REDIS_DB=15' \
+            'CACHE_REDIS_DB=0' \
+            'QUEUE_REDIS_DB=1' > .env
+          chmod 600 .env .secrets/*
+      - name: Run destructive isolated integration tests
+        run: set -o pipefail; make test-integration 2>&1 | tee artifacts/integration.log
+      - name: Capture dependency logs
+        if: failure()
+        env:
+          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+          REDIS_CONTAINER: ${{ job.services.redis.id }}
+        run: |
+          docker logs "$POSTGRES_CONTAINER" > artifacts/postgres.log 2>&1 || true
+          docker logs "$REDIS_CONTAINER" > artifacts/redis.log 2>&1 || true
+      - name: Upload integration artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: integration-${{ github.sha }}
+          path: artifacts
+          if-no-files-found: error
+          retention-days: 14
+
+  images:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [user-service, order-service, payment-service, job-worker, job-admin, migrator]
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build image
+        run: |
+          docker build \
+            --build-arg SERVICE="${{ matrix.service }}" \
+            --build-arg VERSION="${GITHUB_SHA}" \
+            --build-arg REVISION="${GITHUB_SHA}" \
+            --tag "distributed-commerce/${{ matrix.service }}:${GITHUB_SHA}" \
+            --file Containerfile .
+          test "$(docker image inspect --format '{{.Config.User}}' "distributed-commerce/${{ matrix.service }}:${GITHUB_SHA}")" = '65532:65532'
+      - name: Export image archive and metadata
+        run: |
+          install -d artifacts
+          docker image inspect "distributed-commerce/${{ matrix.service }}:${GITHUB_SHA}" > "artifacts/${{ matrix.service }}-inspect.json"
+          docker save "distributed-commerce/${{ matrix.service }}:${GITHUB_SHA}" | gzip -n > "artifacts/${{ matrix.service }}.tar.gz"
+          sha256sum "artifacts/${{ matrix.service }}.tar.gz" > "artifacts/${{ matrix.service }}.sha256"
+      - name: Upload image artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: image-${{ matrix.service }}-${{ github.sha }}
+          path: artifacts
+          if-no-files-found: error
+          retention-days: 7
+
+  benchmarks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+      - name: Record informational benchmarks
+        run: |
+          install -d artifacts
+          set -o pipefail
+          make benchmark BENCHTIME=1s COUNT=5 2>&1 | tee artifacts/benchmarks.txt
+          uname -a > artifacts/runner.txt
+          go version >> artifacts/runner.txt
+      - name: Upload benchmark artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: benchmarks-${{ github.sha }}
+          path: artifacts
+          if-no-files-found: error
+          retention-days: 30

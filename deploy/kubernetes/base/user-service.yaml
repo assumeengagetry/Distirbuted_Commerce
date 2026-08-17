@@ -1,0 +1,23 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: commerce-user
+  namespace: commerce
+  labels:
+    app.kubernetes.io/name: distributed-commerce
+    app.kubernetes.io/component: user
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: distributed-commerce
+    app.kubernetes.io/component: user
+  ports:
+    - name: https
+      port: 443
+      targetPort: https
+      protocol: TCP
+      appProtocol: https
+    - name: identity
+      port: 9091
+      targetPort: identity
+      protocol: TCP

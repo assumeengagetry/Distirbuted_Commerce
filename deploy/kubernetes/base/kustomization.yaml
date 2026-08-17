@@ -1,0 +1,22 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - namespace.yaml
+  - serviceaccounts.yaml
+  - configmap-common.yaml
+  - configmap-user.yaml
+  - configmap-order.yaml
+  - configmap-payment.yaml
+  - configmap-worker.yaml
+  - user-deployment.yaml
+  - user-service.yaml
+  - user-pdb.yaml
+  - order-deployment.yaml
+  - order-service.yaml
+  - order-pdb.yaml
+  - payment-deployment.yaml
+  - payment-service.yaml
+  - payment-pdb.yaml
+  - worker-deployment.yaml
+  - migration-job.yaml
+  - networkpolicies.yaml
