@@ -1,0 +1,126 @@
+name: Trusted release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish ${{ matrix.service }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    environment: production
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [user-service, order-service, payment-service, job-worker, job-admin, migrator]
+    env:
+      IMAGE: ghcr.io/assumeengagetry/distributed-commerce/${{ matrix.service }}
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Verify release ref
+        run: |
+          test "$(git cat-file -t "$GITHUB_REF")" = tag
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+          test -z "$(git status --porcelain)"
+      - name: Authenticate to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+      - name: Build and push immutable image
+        id: build
+        run: |
+          install -d artifacts
+          docker buildx build \
+            --platform linux/amd64 \
+            --build-arg SERVICE="${{ matrix.service }}" \
+            --build-arg VERSION="$GITHUB_REF_NAME" \
+            --build-arg REVISION="$GITHUB_SHA" \
+            --tag "$IMAGE:$GITHUB_REF_NAME" \
+            --metadata-file artifacts/build-metadata.json \
+            --push \
+            --file Containerfile .
+          digest="$(jq -r '."containerimage.digest"' artifacts/build-metadata.json)"
+          test "$digest" != null
+          test "${#digest}" -eq 71
+          printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+      - name: Generate SPDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+          format: spdx-json
+          output-file: artifacts/${{ matrix.service }}.spdx.json
+          upload-artifact: false
+          syft-version: v1.51.0
+      - name: Scan final image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+          format: sarif
+          output: artifacts/${{ matrix.service }}-trivy.sarif
+          exit-code: "1"
+          ignore-unfixed: false
+          severity: HIGH,CRITICAL
+          version: v0.74.0
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.1.3
+      - name: Sign image digest with GitHub OIDC
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "$IMAGE@$DIGEST"
+      - name: Attest build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+      - name: Attest SPDX SBOM
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          sbom-path: artifacts/${{ matrix.service }}.spdx.json
+          push-to-registry: true
+      - name: Write release evidence
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          containerfile_sha="$(sha256sum Containerfile | cut -d' ' -f1)"
+          migrations_sha="$(find db/migrations -type f -name '*.sql' -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)"
+          jq -n \
+            --arg service "${{ matrix.service }}" \
+            --arg image "$IMAGE" \
+            --arg digest "$DIGEST" \
+            --arg version "$GITHUB_REF_NAME" \
+            --arg source_sha "$GITHUB_SHA" \
+            --arg platform "linux/amd64" \
+            --arg containerfile_sha256 "$containerfile_sha" \
+            --arg migrations_sha256 "$migrations_sha" \
+            '{schema:1,service:$service,image:$image,digest:$digest,version:$version,source_sha:$source_sha,platform:$platform,containerfile_sha256:$containerfile_sha256,migrations_sha256:$migrations_sha256,sbom:"spdx-json",scan_severity_gate:["HIGH","CRITICAL"],signature:"cosign-keyless",provenance:"slsa-v1"}' \
+            > "artifacts/${{ matrix.service }}-release.json"
+      - name: Upload release evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-${{ matrix.service }}-${{ github.ref_name }}
+          path: artifacts
+          if-no-files-found: error
+          retention-days: 90

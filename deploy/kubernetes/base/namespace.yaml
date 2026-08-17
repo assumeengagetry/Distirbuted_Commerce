@@ -4,3 +4,6 @@ metadata:
   name: commerce
   labels:
     app.kubernetes.io/part-of: distributed-commerce
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted

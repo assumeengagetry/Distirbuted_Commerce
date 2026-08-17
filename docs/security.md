@@ -1,11 +1,13 @@
 # Security
 
-This document is a threat-oriented description of the Phase 8 security
+This document is a threat-oriented description of the Phase 9 security
 posture. It records implemented controls and known gaps; it does not assert that
 the software is vulnerability-free. Operational details are in
 [operations.md](operations.md), system boundaries in
 [architecture.md](architecture.md), and the externally visible behavior in the
-[OpenAPI contract](../api/openapi/commerce.yaml).
+[OpenAPI contract](../api/openapi/commerce.yaml). Trusted publication and image
+admission are in [release.md](release.md); external recovery and credential
+rotation are in [backup-restore.md](backup-restore.md).
 
 ## Assets
 
@@ -29,7 +31,8 @@ The primary assets are:
 PostgreSQL is the authoritative data asset. Redis cache entries and queue state
 are not substitutes for database recovery. The external database, Redis
 services, Collector, and telemetry stores need independent backup, access,
-patching, audit, and incident-response controls.
+patching, audit, and incident-response controls. The repository does not replace
+provider backup; see [backup-restore.md](backup-restore.md).
 
 ## Trust boundaries
 
@@ -180,16 +183,23 @@ limited to order/payment Pods. Worker and migrator have no allowed inbound
 application traffic.
 
 The base does not define default-deny egress, destination-specific dependency
-egress, namespace Pod Security Admission labels, an ingress/Gateway, image
-signature policy, runtime sandboxing beyond RuntimeDefault seccomp, or a
-NetworkPolicy for external provider addresses. NetworkPolicy effectiveness
-also depends on the cluster CNI. Add and test those controls in the target
+egress, namespace Pod Security Admission labels, an ingress/Gateway, runtime
+sandboxing beyond RuntimeDefault seccomp, or a NetworkPolicy for external
+provider addresses. A fail-closed
+[Kyverno image policy](../security/policies/kyverno/verify-images.yaml) is
+supplied separately but is cluster-scoped, optional, and not installed by the
+application overlay. NetworkPolicy and admission effectiveness depend on the
+external cluster. Add, operate, and test those controls in the target
 environment; do not infer them from the application manifests.
 
 Production image names and digests in the overlay are placeholders. Applying
-them unchanged is a release failure. The repository CI builds images but does
-not publish, sign, scan OS packages in exported images, produce an SBOM, or
-configure admission verification.
+them unchanged is a release failure. Normal CI builds images without publishing
+them. The separate trusted `v*` tag workflow publishes to GHCR, scans final
+images with Trivy, generates Syft SPDX SBOMs, signs digests with keyless Cosign,
+and publishes GitHub provenance and SBOM attestations. GitHub rulesets,
+environment approval, registry retention, long-term evidence custody, Kyverno
+installation, and overlay promotion remain external controls; see
+[release.md](release.md).
 
 ## Application input and abuse controls
 
@@ -255,15 +265,16 @@ processors. Trace sampling is a cost/privacy control, not an access control.
 | PostgreSQL compromise | Verified TLS, process-specific URL contract, hashes instead of raw refresh/idempotency values, constraints | Shared schema and cross-domain grants increase blast radius; database encryption, HA, backup, and audit are external |
 | Denial of service | Timeouts, body/message caps, rate limits, Argon semaphore, pool bounds, container limits | Database locks, connection exhaustion, expensive auth, queue backlog, and edge floods can still exhaust capacity; no HPA/WAF |
 | Telemetry exfiltration | Loopback metrics, bounded labels, omitted SQL/Redis details, optional authenticated OTLP | Logs and spans remain sensitive; Collector/storage policy is external; operator-added attributes can regress privacy |
-| Supply-chain compromise | Pinned Go modules, digest-pinned builder, commit-pinned CI actions, tests, `govulncheck`, immutable production digest contract | No claim of complete dependency scanning; no image signing, SBOM, registry policy, or admission verification is supplied |
+| Supply-chain compromise | Pinned Go modules and actions, digest-pinned builder, tests, `govulncheck`, protected-tag release contract, Trivy image gate, Syft SPDX SBOM, keyless Cosign signature, GitHub attestations, immutable deployment digests, and optional Kyverno policy | No claim of complete vulnerability detection; tag rules, environment approval, GHCR retention, Sigstore availability, evidence custody, and Kyverno operation are external |
 | Operator misuse | No bulk task mutation, single-task lock, separate migrator/admin binaries, immutable payment records | Cluster/database operators remain highly privileged; job deletion and schema changes need external approval and audit |
 | Best-effort async delivery | Current task is idempotent, periodic scheduling, retries/archive, inline fallback | There is no transactional outbox; this mechanism is unsuitable for authoritative external side effects |
 
 Additional product gaps include email verification, password reset, MFA,
 account deletion, administrator bootstrap, customer funding, refunds,
 cancellation, automatic restock, security audit history, dashboards, alerting,
-and a tested repository-provided disaster-recovery system. Their absence must
-be included in deployment risk acceptance.
+and repository-provided backup or disaster-recovery automation. Their absence
+must be included in deployment risk acceptance; the external recovery contract
+is documented in [backup-restore.md](backup-restore.md).
 
 ## Release security checklist
 
@@ -274,24 +285,27 @@ be included in deployment risk acceptance.
 2. Review changes to the [OpenAPI contract](../api/openapi/commerce.yaml),
    [identity protobuf](../api/proto/identity/v1/identity.proto), migrations, auth
    logic, authorization queries, secret references, and NetworkPolicies.
-3. Build from the reviewed [Containerfile](../Containerfile), scan source and
-   final images with the organization's current tools, generate an SBOM, sign
-   the approved digest, and enforce signature/digest admission externally.
+3. Complete the [trusted release verification](release.md#verification-and-evidence),
+   including the Trivy result, Syft SPDX SBOM, Cosign signature, both GitHub
+   attestations, and externally retained evidence. Independently scan or review
+   risks not covered by the enforced gate.
 4. Replace every production image and dependency placeholder. Run
    `make kube-check` and verify rendered output contains no Secret resources or
    secret values.
-5. Verify external PostgreSQL backup and restore, migration-role separation,
-   runtime grants, `verify-full` URLs, Redis persistence/`noeviction`, ACLs,
-   TLS names, and capacity headroom.
+5. Verify the external
+   [backup and restore contract](backup-restore.md#restore-drills), migration-role
+   separation, runtime grants, `verify-full` URLs, Redis
+   persistence/`noeviction`, ACLs, TLS names, and capacity headroom.
 6. Verify HTTP SANs, identity server DNS SAN, exactly-one client SPIFFE URI SAN,
    CA bundles, expiry windows, Secret ownership, encrypted secret storage, and
    audited secret-controller access.
 7. Verify trusted ingress namespace labels, TLS passthrough or verified
    re-encryption, CNI NetworkPolicy enforcement, destination-specific egress,
    and absence of unintended public Services.
-8. Apply the [migration-first rollout](operations.md#migration-first-rollout),
-   then test readiness, authentication failure modes, customer ownership,
-   admin denial/allow paths, and same-key idempotent replay before full traffic.
+8. Complete [overlay promotion](release.md#overlay-promotion), apply the
+   [migration-first rollout](operations.md#migration-first-rollout), then test
+   readiness, authentication failure modes, customer ownership, admin
+   denial/allow paths, and same-key idempotent replay before full traffic.
 9. Verify loopback metrics collection, alert routing, OTLP authentication,
    sampling, Collector redaction, retention, and that no secret or high-cardinality
    attribute was introduced.

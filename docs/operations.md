@@ -1,9 +1,10 @@
 # Operations
 
-This runbook covers local development and the Phase 8 production deployment
+This runbook covers local development and the Phase 9 production deployment
 contract. Read [architecture.md](architecture.md) for dependency and consistency
-boundaries and [security.md](security.md) before changing trust, secrets, or
-network policy.
+boundaries, [security.md](security.md) before changing trust, secrets, or network
+policy, [release.md](release.md) for trusted publication and promotion, and
+[backup-restore.md](backup-restore.md) for recovery and credential rotation.
 
 The Kubernetes manifests deploy only user-service, order-service,
 payment-service, job-worker, and the migrator Job. They do not deploy
@@ -21,6 +22,8 @@ dependencies must exist and be operated separately.
 - Production placeholders and prerequisites: [overlay README](../deploy/kubernetes/overlays/production/README.md)
 - Required externally managed Secret keys: [Secret contract](../deploy/kubernetes/overlays/production/secrets-contract.md)
 - CI gates and produced artifacts: [`.github/workflows/ci.yml`](../.github/workflows/ci.yml)
+- Trusted tag publication, release evidence, admission, and promotion: [release.md](release.md)
+- External backup, restore, and credential-rotation contract: [backup-restore.md](backup-restore.md)
 
 ## Local operation
 
@@ -100,13 +103,17 @@ make images IMAGE_PREFIX=registry.example.com/distributed-commerce IMAGE_VERSION
 The final image is a scratch image containing the selected `/app/service`, the
 `/app/loopback-probe` helper, and the public CA bundle. It runs as
 `65532:65532`. The CI image job builds and archives each image and verifies the
-configured user, but it does not publish, sign, generate an SBOM for, or admit
-the image to a cluster. Perform those release-system steps externally.
+configured user. Separately, the Phase 9 trusted tag workflow publishes all six
+images to GHCR, scans them, generates SPDX SBOMs, signs their digests, publishes
+GitHub provenance and SBOM attestations, and records release evidence. Cluster
+admission and promotion are separate controls described in
+[release.md](release.md); the repository does not install or operate them.
 
-Push the approved images, record registry digests, then replace every
-`registry.example.invalid` name and all-zero digest in the
+Use the approved GHCR digests, then replace every `registry.example.invalid`
+name and all-zero digest in the
 [production kustomization](../deploy/kubernetes/overlays/production/kustomization.yaml).
-Deploy immutable digests, not mutable tags.
+Deploy immutable digests, not mutable tags, and follow the
+[overlay promotion procedure](release.md#overlay-promotion).
 
 ## Production prerequisites
 
@@ -114,7 +121,9 @@ Deploy immutable digests, not mutable tags.
 
 Provision and validate these before creating application Pods:
 
-1. A backed-up PostgreSQL service reachable by all application roles. It must
+1. A PostgreSQL service reachable by all application roles, with external full
+   backups and PITR meeting the
+   [recovery contract](backup-restore.md#postgresql-backup-policy). It must
    support the `pgcrypto` extension and verified TLS. Use a schema-owner URL for
    the migrator and least-privilege, process-specific runtime URLs.
 2. A dedicated queue Redis service with persistence, bounded memory,
@@ -176,8 +185,10 @@ Kustomize renders resources but does not order a Job before Deployments. A
 single `kubectl apply -k` is therefore not migration-first. The delivery system
 must partition the rendered objects or use equivalent synchronization.
 
-1. Pass `make release-check`, approve immutable image digests, and back up the
-   external database. Review every migration under
+1. Pass `make release-check`, complete the
+   [trusted release gates](release.md#verification-and-evidence), approve
+   immutable image digests, and confirm an external database recovery point.
+   Review every migration under
    [`db/migrations`](../db/migrations/) for forward and backward binary
    compatibility.
 2. Render and validate the production overlay with `make kube-check`. Reject
@@ -326,6 +337,10 @@ worker or an external dependency.
 ## Rollback
 
 Application rollback and schema rollback are separate decisions.
+Release evidence and digest rollback are detailed in
+[release.md](release.md#failure-and-rollback); database recovery and dirty
+migration handling are detailed in
+[backup-restore.md](backup-restore.md#migration-dirty-state).
 
 1. Stop the rollout and preserve logs, events, the migration result, image
    digests, and request IDs that demonstrate the failure.
@@ -374,14 +389,19 @@ task ID. There is no bulk wildcard operation.
 Asynq delivery is at least once. A retry may run work that completed before its
 acknowledgement, which is safe only because the current cleanup handler is
 idempotent. Redis persistence, backup, failover, and queue restoration are not
-implemented by these manifests. Never flush or repurpose the production queue
-database to recover application availability.
+implemented by these manifests; follow the external
+[queue recovery contract](backup-restore.md#queue-redis-persistence-and-recovery).
+Never flush or repurpose the production queue database to recover application
+availability.
 
 ## Certificate and key rotation
 
 HTTP, gRPC, Redis, PostgreSQL, OTLP certificates, CA pools, and the PASETO key
 are loaded at process startup. Projected Secret file updates do not reload them;
 every change requires a controlled rollout.
+Database and Redis credential rotation, dangerous-operation approval, and the
+complete recovery boundary are in
+[backup-restore.md](backup-restore.md#credential-rotation).
 
 For a leaf certificate under an unchanged CA, publish the new Secret, verify
 SANs and validity, then roll every consumer. For a CA change, first publish a

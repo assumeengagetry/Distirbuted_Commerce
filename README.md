@@ -1,8 +1,8 @@
 # Distributed Commerce Platform
 
-A production-oriented Go microservice portfolio project built incrementally around transactional commerce workflows. The repository currently implements **Phase 8**: the service foundation, transactional commerce workflows, centralized gRPC identity, Redis caching, retrying Asynq jobs, Prometheus metrics, OpenTelemetry traces, production OCI images, Kubernetes manifests, an OpenAPI contract, CI gates, and reproducible benchmark entry points.
+A production-oriented Go microservice portfolio project built incrementally around transactional commerce workflows. The repository currently implements **Phase 9**: the service foundation, transactional commerce workflows, centralized gRPC identity, Redis caching, retrying Asynq jobs, Prometheus metrics, OpenTelemetry traces, production OCI images, Kubernetes manifests, an OpenAPI contract, CI gates, reproducible benchmarks, and a trusted image release/admission contract.
 
-External payment providers, refunds, cancellation/restock workflows, transactional outbox delivery, hosted observability backends, dashboards, and alerting are intentionally not claimed as implemented yet.
+External payment providers, refunds, cancellation/restock workflows, transactional outbox delivery, hosted observability backends, dashboards, alerting, provider-managed backup storage, and cluster-installed admission controllers are intentionally not claimed as repository-managed features.
 
 ## Current Status
 
@@ -49,6 +49,9 @@ Implemented:
 - OpenAPI 3.1 HTTP contract validated against the concrete route set
 - GitHub Actions quality, integration, image, vulnerability, and informational benchmark jobs
 - Architecture, operations, and threat-oriented security documentation under `docs/`
+- Protected-tag release workflow with digest capture, SPDX SBOM, Trivy gate, Cosign keyless signature, and GitHub provenance attestations
+- Structured rendered-manifest verification and optional fail-closed Kyverno image admission policy
+- Release and backup/restore runbooks that separate repository controls from provider and cluster responsibilities
 - PostgreSQL-backed readiness, process liveness, and signal-aware graceful shutdown
 - Rootless PostgreSQL and Redis infrastructure using Podman Quadlet and systemd user units
 - Unit, HTTP, race, and real PostgreSQL/Redis integration tests
@@ -113,6 +116,7 @@ Gin and gRPC remain transport adapters around typed boundaries. The three API pr
 ├── cmd/job-admin/             # Restricted archived-task operations
 ├── cmd/migrator/              # One-shot embedded migration runner
 ├── cmd/loopback-probe/        # Minimal worker container probe
+├── cmd/release-verify/        # Immutable production manifest verifier
 ├── internal/auth/             # Argon2id, PASETO, refresh tokens, principal context
 ├── internal/user/             # Models, business rules, service, repository boundary
 ├── internal/order/            # Catalog, inventory, order rules and repository boundary
@@ -135,6 +139,8 @@ Gin and gRPC remain transport adapters around typed boundaries. The three API pr
 ├── db/query/                  # Reviewed SQL consumed by sqlc
 ├── deploy/quadlet/            # Rootless Podman systemd units
 ├── deploy/kubernetes/         # Kustomize production deployment contract
+├── security/policies/         # Optional cluster-level image admission policy
+├── release/                   # External release evidence contract (when populated)
 ├── docs/                      # Architecture, operations, and security runbooks
 ├── Containerfile              # Reproducible static OCI image build
 ├── .github/workflows/         # CI and artifact pipeline
@@ -163,6 +169,7 @@ Gin and gRPC remain transport adapters around typed boundaries. The three API pr
 | Cache and queue | Redis 7.4, go-redis 9.22, Asynq 0.26 |
 | Logging | Standard library `log/slog` |
 | Metrics and traces | Prometheus client 1.24, OpenTelemetry 1.45/contrib 0.70, OTLP/gRPC |
+| Supply chain | Syft 1.51, Trivy 0.74, Cosign 3.1, GitHub attestations, Kyverno policy |
 | Service manager | systemd user services |
 
 ## HTTP API
@@ -297,6 +304,8 @@ make release-check
 ```
 
 `make benchmark` records parsing, validation, hashing, and cache-decoding costs only. Shared CI runner results are informational and are not service capacity claims. Read [docs/architecture.md](docs/architecture.md), [docs/operations.md](docs/operations.md), and [docs/security.md](docs/security.md) before production deployment.
+
+Phase 9 release controls are documented in [docs/release.md](docs/release.md) and [docs/backup-restore.md](docs/backup-restore.md). `make release-manifest-check FILE=<rendered.yaml>` is the promotion gate for a fully substituted overlay; the checked-in production overlay deliberately remains a non-deployable placeholder until a trusted release supplies real digests.
 
 ## Database Schema
 
@@ -803,6 +812,7 @@ CI and benchmark artifacts are reproducible inputs for release review; no perfor
 6. **Phase 6 complete:** fail-open Redis product cache, generation-fenced invalidation, Asynq maintenance jobs, retries, archive handling, and recovery tooling.
 7. **Phase 7 complete:** isolated Prometheus endpoints, explicit OTel providers, OTLP traces, cross-HTTP/gRPC/database/cache/job propagation, and correlated logs.
 8. **Phase 8 complete:** production images, Kubernetes, OpenAPI, CI, benchmarks, and final portfolio documentation.
+9. **Phase 9 complete:** digest-based release evidence, SBOM/vulnerability/signature/provenance workflow, rendered-manifest verification, optional image admission policy, and backup/restore governance.
 
 ## Known Limitations
 
@@ -821,4 +831,4 @@ CI and benchmark artifacts are reproducible inputs for release review; no perfor
 - The local PostgreSQL bootstrap role owns the development database; separate production migrator/runtime roles arrive with production deployment work.
 - A fresh database has no administrator bootstrap or customer funding command, so the documented HTTP examples alone cannot complete an admin-create-to-payment walkthrough.
 - Prometheus storage, the OpenTelemetry Collector, dashboards, SLOs, and alert routing are external deployment concerns and are not bundled in this repository.
-- Registry signing, SBOM generation, image admission, and environment-specific NetworkPolicy CIDRs remain release-platform responsibilities; the CI image job only builds, inspects, and archives images.
+- Registry credentials, protected tag/environment settings, Kyverno installation, environment-specific egress CIDRs, and provider backup/restore execution remain release-platform responsibilities; the repository supplies the workflow and reviewed contracts but cannot enforce external control-plane settings.

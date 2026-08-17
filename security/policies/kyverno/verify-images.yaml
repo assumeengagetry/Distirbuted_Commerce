@@ -1,0 +1,59 @@
+apiVersion: policies.kyverno.io/v1
+kind: ImageValidatingPolicy
+metadata:
+  name: verify-distributed-commerce-images
+spec:
+  failurePolicy: Fail
+  validationActions: [Deny]
+  webhookConfiguration:
+    timeoutSeconds: 30
+  evaluation:
+    background:
+      enabled: false
+  autogen:
+    podControllers:
+      controllers: [Deployment, Job]
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+  matchImageReferences:
+    - glob: ghcr.io/assumeengagetry/distributed-commerce/*
+  validationConfigurations:
+    mutateDigest: true
+    verifyDigest: true
+    required: true
+  attestors:
+    - name: githubRelease
+      cosign:
+        keyless:
+          identities:
+            - issuer: https://token.actions.githubusercontent.com
+              subjectRegExp: >-
+                https://github.com/assumeengagetry/Distirbuted_Commerce/.github/workflows/release.yml@refs/tags/v.*
+        ctlog:
+          url: https://rekor.sigstore.dev
+  attestations:
+    - name: provenance
+      intoto:
+        type: https://slsa.dev/provenance/v1
+    - name: sbom
+      intoto:
+        type: https://spdx.dev/Document/v2.3
+  validations:
+    - expression: >-
+        images.containers.map(image,
+          verifyImageSignatures(image, [attestors.githubRelease])).all(count, count > 0)
+      message: image signature from the trusted GitHub release workflow is required
+    - expression: >-
+        images.containers.map(image,
+          verifyAttestationSignatures(image, attestations.provenance,
+            [attestors.githubRelease])).all(count, count > 0)
+      message: signed SLSA provenance is required
+    - expression: >-
+        images.containers.map(image,
+          verifyAttestationSignatures(image, attestations.sbom,
+            [attestors.githubRelease])).all(count, count > 0)
+      message: signed SPDX SBOM attestation is required

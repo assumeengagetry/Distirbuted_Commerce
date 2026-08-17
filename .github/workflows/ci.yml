@@ -32,7 +32,7 @@ jobs:
           cache: true
           cache-dependency-path: go.sum
       - name: Validate contracts and static analysis
-        run: make proto-check openapi-check kube-check workflow-check fmt-check vet sqlc-vet mod-check
+        run: make proto-check openapi-check kube-check policy-check workflow-check fmt-check vet sqlc-vet mod-check
       - name: Run tests with coverage
         run: |
           install -d artifacts
@@ -42,7 +42,7 @@ jobs:
       - name: Build binaries and checksums
         run: |
           make build
-          sha256sum bin/user-service bin/order-service bin/payment-service bin/job-worker bin/job-admin bin/migrator bin/loopback-probe > artifacts/checksums.txt
+          sha256sum bin/user-service bin/order-service bin/payment-service bin/job-worker bin/job-admin bin/migrator bin/loopback-probe bin/release-verify > artifacts/checksums.txt
       - name: Scan reachable vulnerabilities
         run: make vulncheck
       - name: Upload quality artifacts
