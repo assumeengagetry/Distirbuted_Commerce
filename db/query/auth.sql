@@ -66,8 +66,8 @@ DELETE FROM auth_sessions AS target
 WHERE target.id IN (
     SELECT expired.id
     FROM auth_sessions AS expired
-    WHERE expired.expires_at <= $1
+    WHERE expired.expires_at <= CURRENT_TIMESTAMP
     ORDER BY expired.expires_at
-    LIMIT $2
+    LIMIT $1
     FOR UPDATE SKIP LOCKED
 );

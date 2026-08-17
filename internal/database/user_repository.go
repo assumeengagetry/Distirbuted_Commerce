@@ -268,11 +268,8 @@ func (r *UserRepository) GetProfile(ctx context.Context, userID uuid.UUID) (user
 	return profileFromProfileRow(row)
 }
 
-func (r *UserRepository) DeleteExpiredSessions(ctx context.Context, before time.Time, batchSize int32) (int64, error) {
-	deleted, err := r.queries.DeleteExpiredAuthSessions(ctx, store.DeleteExpiredAuthSessionsParams{
-		ExpiresAt: before,
-		Limit:     batchSize,
-	})
+func (r *UserRepository) DeleteExpiredSessions(ctx context.Context, batchSize int32) (int64, error) {
+	deleted, err := r.queries.DeleteExpiredAuthSessions(ctx, batchSize)
 	if err != nil {
 		return 0, fmt.Errorf("delete expired auth sessions: %w", err)
 	}

@@ -114,20 +114,15 @@ DELETE FROM auth_sessions AS target
 WHERE target.id IN (
     SELECT expired.id
     FROM auth_sessions AS expired
-    WHERE expired.expires_at <= $1
+    WHERE expired.expires_at <= CURRENT_TIMESTAMP
     ORDER BY expired.expires_at
-    LIMIT $2
+    LIMIT $1
     FOR UPDATE SKIP LOCKED
 )
 `
 
-type DeleteExpiredAuthSessionsParams struct {
-	ExpiresAt time.Time `json:"expires_at"`
-	Limit     int32     `json:"limit"`
-}
-
-func (q *Queries) DeleteExpiredAuthSessions(ctx context.Context, arg DeleteExpiredAuthSessionsParams) (int64, error) {
-	result, err := q.db.Exec(ctx, deleteExpiredAuthSessions, arg.ExpiresAt, arg.Limit)
+func (q *Queries) DeleteExpiredAuthSessions(ctx context.Context, limit int32) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteExpiredAuthSessions, limit)
 	if err != nil {
 		return 0, err
 	}

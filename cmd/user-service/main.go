@@ -17,10 +17,12 @@ import (
 	"github.com/assumeengagetry/distributed-commerce/internal/database"
 	store "github.com/assumeengagetry/distributed-commerce/internal/database/sqlc"
 	identityv1 "github.com/assumeengagetry/distributed-commerce/internal/genproto/identity/v1"
+	"github.com/assumeengagetry/distributed-commerce/internal/jobs"
 	"github.com/assumeengagetry/distributed-commerce/internal/observability"
 	"github.com/assumeengagetry/distributed-commerce/internal/platform/grpcserver"
 	"github.com/assumeengagetry/distributed-commerce/internal/platform/httpserver"
 	"github.com/assumeengagetry/distributed-commerce/internal/platform/process"
+	"github.com/assumeengagetry/distributed-commerce/internal/redisclient"
 	grpctransport "github.com/assumeengagetry/distributed-commerce/internal/transport/grpc"
 	httptransport "github.com/assumeengagetry/distributed-commerce/internal/transport/http"
 	"github.com/assumeengagetry/distributed-commerce/internal/user"
@@ -87,6 +89,21 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("create token manager: %w", err)
 	}
+	var cleanupScheduler user.SessionCleanupScheduler
+	if cfg.Jobs.Enabled {
+		queueRedis, err := redisclient.New(cfg.Jobs.Redis)
+		if err != nil {
+			return fmt.Errorf("create queue Redis client: %w", err)
+		}
+		defer queueRedis.Close()
+		cleanupScheduler, err = jobs.NewClient(queueRedis, jobs.ClientConfig{
+			Queue: cfg.Jobs.Queue, EnqueueTimeout: cfg.Jobs.EnqueueTimeout,
+			TaskTimeout: cfg.Jobs.TaskTimeout, UniqueTTL: cfg.Jobs.UniqueTTL,
+		})
+		if err != nil {
+			return fmt.Errorf("create job client: %w", err)
+		}
+	}
 	userService, err := user.NewService(
 		database.NewUserRepository(pool, cfg.Database.LockTimeout, cfg.Database.OperationTimeout),
 		passwords,
@@ -97,6 +114,7 @@ func run() error {
 			RefreshReuseGrace: cfg.Auth.RefreshReuseGrace,
 			DatabaseTimeout:   cfg.Database.OperationTimeout,
 			Now:               time.Now,
+			SessionCleanup:    cleanupScheduler,
 		},
 	)
 	if err != nil {

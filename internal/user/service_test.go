@@ -113,6 +113,8 @@ func TestServiceLogin(t *testing.T) {
 		},
 	}
 	service, tokenManager, now := newTestService(t, repository, &fakePasswordManager{})
+	scheduler := &fakeSessionCleanupScheduler{}
+	service.sessionCleanup = scheduler
 	result, err := service.Login(t.Context(), LoginRequest{Email: "USER@EXAMPLE.COM", Password: "correct-password"})
 	if err != nil {
 		t.Fatalf("Login() error = %v", err)
@@ -123,6 +125,9 @@ func TestServiceLogin(t *testing.T) {
 	principal, err := tokenManager.ParseAccess(result.Tokens.AccessToken, now)
 	if err != nil || principal.UserID != profile.User.ID {
 		t.Fatalf("access principal = (%+v, %v)", principal, err)
+	}
+	if scheduler.calls != 1 {
+		t.Fatalf("ScheduleSessionCleanup() calls = %d, want 1", scheduler.calls)
 	}
 }
 
@@ -195,6 +200,8 @@ func TestServiceRefresh(t *testing.T) {
 		},
 	}
 	service, _, _ := newTestService(t, repository, &fakePasswordManager{})
+	scheduler := &fakeSessionCleanupScheduler{}
+	service.sessionCleanup = scheduler
 	result, err := service.Refresh(t.Context(), current.Raw)
 	if err != nil {
 		t.Fatalf("Refresh() error = %v", err)
@@ -204,6 +211,9 @@ func TestServiceRefresh(t *testing.T) {
 	}
 	if result.Tokens.RefreshToken == current.Raw || !result.Tokens.RefreshExpiresAt.Equal(sessionExpiry) {
 		t.Errorf("rotated token result = %+v", result.Tokens)
+	}
+	if scheduler.calls != 1 {
+		t.Fatalf("ScheduleSessionCleanup() calls = %d, want 1", scheduler.calls)
 	}
 }
 
@@ -271,6 +281,62 @@ func TestServiceGetProfileRejectsDisabledUser(t *testing.T) {
 	}
 }
 
+func TestServiceFallsBackAfterCleanupEnqueueFailure(t *testing.T) {
+	t.Parallel()
+	var cleanupCalls int
+	repository := &fakeRepository{createUser: func(_ context.Context, params CreateUserParams) (Profile, error) {
+		return profileFromCreateParams(params), nil
+	}, deleteExpiredSessions: func(ctx context.Context, batchSize int32) (int64, error) {
+		cleanupCalls++
+		if ctx.Err() != nil {
+			t.Errorf("fallback cleanup context error = %v", ctx.Err())
+		}
+		if batchSize != sessionCleanupBatch {
+			t.Errorf("fallback cleanup batch = %d, want %d", batchSize, sessionCleanupBatch)
+		}
+		return 0, nil
+	}}
+	service, _, _ := newTestService(t, repository, &fakePasswordManager{})
+	scheduler := &fakeSessionCleanupScheduler{err: errors.New("queue unavailable")}
+	service.sessionCleanup = scheduler
+
+	if _, err := service.Register(t.Context(), RegisterRequest{
+		Email: "jobs@example.com", Password: "a-secure-password", DisplayName: "Jobs",
+	}); err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+	if scheduler.calls != 1 {
+		t.Fatalf("ScheduleSessionCleanup() calls = %d, want 1", scheduler.calls)
+	}
+	if cleanupCalls != 1 {
+		t.Fatalf("fallback cleanup calls = %d, want 1", cleanupCalls)
+	}
+}
+
+func TestServiceCleansExpiredSessionsWhenQueueIsDisabled(t *testing.T) {
+	t.Parallel()
+	var cleanupCalls int
+	repository := &fakeRepository{
+		getCredentials: func(context.Context, string) (Credentials, error) {
+			return Credentials{Profile: testProfile(StatusActive), PasswordHash: "hash:correct-password"}, nil
+		},
+		deleteExpiredSessions: func(context.Context, int32) (int64, error) {
+			cleanupCalls++
+			return 3, nil
+		},
+	}
+	service, _, _ := newTestService(t, repository, &fakePasswordManager{})
+
+	if _, err := service.Login(t.Context(), LoginRequest{
+		Email: "user@example.com", Password: "correct-password",
+	}); err != nil {
+		t.Fatalf("Login() error = %v", err)
+	}
+	if cleanupCalls != 1 {
+		t.Fatalf("cleanup calls = %d, want 1", cleanupCalls)
+	}
+}
+
 func TestServiceBoundsDatabaseOperations(t *testing.T) {
 	t.Parallel()
 
@@ -313,6 +379,16 @@ type fakePasswordManager struct {
 	verifyErr        error
 }
 
+type fakeSessionCleanupScheduler struct {
+	calls int
+	err   error
+}
+
+func (scheduler *fakeSessionCleanupScheduler) ScheduleSessionCleanup(context.Context) error {
+	scheduler.calls++
+	return scheduler.err
+}
+
 func (f *fakePasswordManager) Hash(password string) (string, error) {
 	if f.hashErr != nil {
 		return "", f.hashErr
@@ -329,12 +405,13 @@ func (f *fakePasswordManager) Verify(password, encodedHash string) (bool, error)
 }
 
 type fakeRepository struct {
-	createUser     func(context.Context, CreateUserParams) (Profile, error)
-	getCredentials func(context.Context, string) (Credentials, error)
-	createSession  func(context.Context, CreateSessionParams) error
-	rotateRefresh  func(context.Context, RotateRefreshTokenParams) (RotationResult, error)
-	revokeSession  func(context.Context, RevokeSessionParams) error
-	getProfile     func(context.Context, uuid.UUID) (Profile, error)
+	createUser            func(context.Context, CreateUserParams) (Profile, error)
+	getCredentials        func(context.Context, string) (Credentials, error)
+	createSession         func(context.Context, CreateSessionParams) error
+	rotateRefresh         func(context.Context, RotateRefreshTokenParams) (RotationResult, error)
+	revokeSession         func(context.Context, RevokeSessionParams) error
+	getProfile            func(context.Context, uuid.UUID) (Profile, error)
+	deleteExpiredSessions func(context.Context, int32) (int64, error)
 }
 
 func (f *fakeRepository) CreateUser(ctx context.Context, params CreateUserParams) (Profile, error) {
@@ -370,8 +447,11 @@ func (f *fakeRepository) GetProfile(ctx context.Context, userID uuid.UUID) (Prof
 	return f.getProfile(ctx, userID)
 }
 
-func (f *fakeRepository) DeleteExpiredSessions(context.Context, time.Time, int32) (int64, error) {
-	return 0, nil
+func (f *fakeRepository) DeleteExpiredSessions(ctx context.Context, batchSize int32) (int64, error) {
+	if f.deleteExpiredSessions == nil {
+		return 0, nil
+	}
+	return f.deleteExpiredSessions(ctx, batchSize)
 }
 
 func newTestService(t *testing.T, repository Repository, passwords PasswordManager) (*Service, *auth.TokenManager, time.Time) {

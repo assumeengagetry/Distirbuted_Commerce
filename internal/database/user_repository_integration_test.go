@@ -269,7 +269,7 @@ func TestUserRepositoryDeletesExpiredSessionsInBatches(t *testing.T) {
 	}
 	t.Cleanup(func() { deleteIntegrationUser(t, pool, params.UserID) })
 
-	deleted, err := repository.DeleteExpiredSessions(ctx, now, 100)
+	deleted, err := repository.DeleteExpiredSessions(ctx, 100)
 	if err != nil {
 		t.Fatalf("DeleteExpiredSessions() error = %v", err)
 	}

@@ -57,5 +57,5 @@ type Repository interface {
 	RotateRefreshToken(ctx context.Context, params RotateRefreshTokenParams) (RotationResult, error)
 	RevokeSession(ctx context.Context, params RevokeSessionParams) error
 	GetProfile(ctx context.Context, userID uuid.UUID) (Profile, error)
-	DeleteExpiredSessions(ctx context.Context, before time.Time, batchSize int32) (int64, error)
+	DeleteExpiredSessions(ctx context.Context, batchSize int32) (int64, error)
 }

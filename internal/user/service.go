@@ -19,6 +19,7 @@ const (
 	minimumPasswordLength = 12
 	maximumPasswordLength = 128
 	defaultCurrency       = "USD"
+	sessionCleanupBatch   = 100
 )
 
 type PasswordManager interface {
@@ -26,11 +27,16 @@ type PasswordManager interface {
 	Verify(password, encodedHash string) (bool, error)
 }
 
+type SessionCleanupScheduler interface {
+	ScheduleSessionCleanup(context.Context) error
+}
+
 type ServiceConfig struct {
 	RefreshTTL        time.Duration
 	RefreshReuseGrace time.Duration
 	DatabaseTimeout   time.Duration
 	Now               func() time.Time
+	SessionCleanup    SessionCleanupScheduler
 }
 
 type Service struct {
@@ -42,6 +48,7 @@ type Service struct {
 	refreshReuseGrace time.Duration
 	databaseTimeout   time.Duration
 	now               func() time.Time
+	sessionCleanup    SessionCleanupScheduler
 	dummyHash         string
 }
 
@@ -102,6 +109,7 @@ func NewService(
 		refreshReuseGrace: cfg.RefreshReuseGrace,
 		databaseTimeout:   cfg.DatabaseTimeout,
 		now:               cfg.Now,
+		sessionCleanup:    cfg.SessionCleanup,
 		dummyHash:         dummyHash,
 	}, nil
 }
@@ -160,7 +168,7 @@ func (s *Service) Register(ctx context.Context, req RegisterRequest) (AuthResult
 	if err != nil {
 		return AuthResult{}, err
 	}
-	s.pruneExpiredSessions(ctx, now)
+	s.maintainExpiredSessions(ctx)
 
 	s.logger.InfoContext(ctx, "user registered", slog.String("user_id", profile.User.ID.String()))
 	return AuthResult{
@@ -232,7 +240,7 @@ func (s *Service) Login(ctx context.Context, req LoginRequest) (AuthResult, erro
 	if err != nil {
 		return AuthResult{}, err
 	}
-	s.pruneExpiredSessions(ctx, now)
+	s.maintainExpiredSessions(ctx)
 
 	s.logger.InfoContext(ctx, "user logged in", slog.String("user_id", credentials.Profile.User.ID.String()))
 	return AuthResult{
@@ -279,7 +287,7 @@ func (s *Service) Refresh(ctx context.Context, rawRefreshToken string) (AuthResu
 	if err != nil {
 		return AuthResult{}, err
 	}
-	s.pruneExpiredSessions(ctx, rotation.RotatedAt)
+	s.maintainExpiredSessions(ctx)
 
 	s.logger.InfoContext(ctx, "refresh token rotated", slog.String("user_id", rotation.Profile.User.ID.String()))
 	return AuthResult{
@@ -323,14 +331,20 @@ func (s *Service) GetProfile(ctx context.Context, userID uuid.UUID) (Profile, er
 	return profile, nil
 }
 
-func (s *Service) pruneExpiredSessions(ctx context.Context, before time.Time) {
-	dbCtx, cancel := context.WithTimeout(ctx, s.databaseTimeout)
-	defer cancel()
-	deleted, err := s.repository.DeleteExpiredSessions(dbCtx, before, 100)
-	if err != nil {
-		if ctx.Err() == nil {
-			s.logger.WarnContext(ctx, "expired auth session cleanup failed", slog.Any("error", err))
+func (s *Service) maintainExpiredSessions(ctx context.Context) {
+	if s.sessionCleanup != nil {
+		if err := s.sessionCleanup.ScheduleSessionCleanup(ctx); err == nil {
+			return
+		} else {
+			s.logger.WarnContext(ctx, "expired auth session cleanup enqueue failed", slog.Any("error", err))
 		}
+	}
+
+	databaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.databaseTimeout)
+	deleted, err := s.repository.DeleteExpiredSessions(databaseCtx, sessionCleanupBatch)
+	cancel()
+	if err != nil {
+		s.logger.WarnContext(ctx, "expired auth session cleanup failed", slog.Any("error", err))
 		return
 	}
 	if deleted > 0 {

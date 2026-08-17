@@ -42,8 +42,8 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.Database.OperationTimeout != 5*time.Second || cfg.Database.LockTimeout != 2*time.Second {
 		t.Errorf("database operation timeouts = (%s, %s), want (5s, 2s)", cfg.Database.OperationTimeout, cfg.Database.LockTimeout)
 	}
-	if cfg.Database.CommitResolutionTimeout != 2*time.Second {
-		t.Errorf("Database.CommitResolutionTimeout = %s, want 2s", cfg.Database.CommitResolutionTimeout)
+	if cfg.Database.CommitResolutionTimeout != 0 {
+		t.Errorf("Database.CommitResolutionTimeout = %s, want 0 for user-service", cfg.Database.CommitResolutionTimeout)
 	}
 	if cfg.Log.Level != "info" {
 		t.Errorf("Log.Level = %q, want info", cfg.Log.Level)
@@ -177,6 +177,26 @@ func TestLoadRejectsCombinedRequestBudget(t *testing.T) {
 	}), "payment-service", "127.0.0.1:8083")
 	if err == nil || !strings.Contains(err.Error(), "must fit within HTTP_WRITE_TIMEOUT") {
 		t.Fatalf("loadWithDefaults() error = %v, want combined request budget error", err)
+	}
+}
+
+func TestLoadValidatesCommitResolutionOnlyForTransactionOwners(t *testing.T) {
+	t.Parallel()
+	_, err := loadWithDefaults(mapLookup(map[string]string{
+		"DATABASE_URL":                 "postgres://commerce:secret@localhost:5432/commerce?sslmode=disable",
+		"HTTP_WRITE_TIMEOUT":           "15s",
+		"DB_OPERATION_TIMEOUT":         "10s",
+		"DB_COMMIT_RESOLUTION_TIMEOUT": "5s",
+	}), "order-service", "127.0.0.1:8082")
+	if err == nil || !strings.Contains(err.Error(), "DB_COMMIT_RESOLUTION_TIMEOUT") {
+		t.Fatalf("order-service load error = %v, want commit-resolution budget error", err)
+	}
+	if _, err := load(mapLookup(map[string]string{
+		"DATABASE_URL":                 "postgres://commerce:secret@localhost:5432/commerce?sslmode=disable",
+		"PASETO_V4_LOCAL_KEY":          testPasetoKey,
+		"DB_COMMIT_RESOLUTION_TIMEOUT": "invalid",
+	})); err != nil {
+		t.Fatalf("user-service rejected unowned commit-resolution setting: %v", err)
 	}
 }
 
@@ -382,15 +402,6 @@ func TestLoadRejectsInvalidConfiguration(t *testing.T) {
 				values["DB_LOCK_TIMEOUT"] = "2s"
 			},
 			wantErr: "DB_LOCK_TIMEOUT",
-		},
-		{
-			name: "commit resolution exceeds write budget",
-			mutate: func(values map[string]string) {
-				values["HTTP_WRITE_TIMEOUT"] = "15s"
-				values["DB_OPERATION_TIMEOUT"] = "10s"
-				values["DB_COMMIT_RESOLUTION_TIMEOUT"] = "5s"
-			},
-			wantErr: "DB_COMMIT_RESOLUTION_TIMEOUT",
 		},
 		{
 			name: "non-positive duration",

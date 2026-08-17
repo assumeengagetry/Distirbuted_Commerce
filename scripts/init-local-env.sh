@@ -51,6 +51,8 @@ chmod 600 "${secrets_dir}/pgpass"
 {
 	printf 'appendonly yes\n'
 	printf 'appendfsync everysec\n'
+	printf 'maxmemory 192mb\n'
+	printf 'maxmemory-policy noeviction\n'
 	printf 'dir /data\n'
 	printf 'user default off\n'
 	printf 'user commerce on >%s ~* &* +@all\n' "${redis_password}"

@@ -2,7 +2,7 @@
 Description=Distributed Commerce Redis
 
 [Container]
-Image=public.ecr.aws/docker/library/redis:7.4-alpine
+Image=public.ecr.aws/docker/library/redis:7.4-alpine@sha256:9702d01c1f10c3ea9f48211b4362e44f154ff02d063e6f7268eba804059f53bf
 ContainerName=commerce-redis
 Network=pasta
 Volume=commerce-redis.volume:/data
@@ -17,7 +17,6 @@ HealthStartPeriod=5s
 HealthTimeout=3s
 HealthOnFailure=kill
 Notify=healthy
-AutoUpdate=registry
 Memory=256m
 PidsLimit=128
 StopTimeout=20

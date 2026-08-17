@@ -16,6 +16,8 @@ import (
 	"github.com/assumeengagetry/distributed-commerce/internal/observability"
 	commerce "github.com/assumeengagetry/distributed-commerce/internal/order"
 	"github.com/assumeengagetry/distributed-commerce/internal/platform/httpserver"
+	"github.com/assumeengagetry/distributed-commerce/internal/productcache"
+	"github.com/assumeengagetry/distributed-commerce/internal/redisclient"
 	httptransport "github.com/assumeengagetry/distributed-commerce/internal/transport/http"
 )
 
@@ -66,13 +68,27 @@ func run() error {
 		return fmt.Errorf("create identity gRPC client: %w", err)
 	}
 	defer identityClient.Close()
-	service, err := commerce.NewService(
-		database.NewOrderRepository(
-			pool, cfg.Database.LockTimeout, cfg.Database.OperationTimeout, cfg.Database.CommitResolutionTimeout,
-		),
-		logger,
-		cfg.Database.OperationTimeout,
+	var repository commerce.Repository = database.NewOrderRepository(
+		pool, cfg.Database.LockTimeout, cfg.Database.OperationTimeout, cfg.Database.CommitResolutionTimeout,
 	)
+	if cfg.ProductCache.Enabled {
+		cacheClient, err := redisclient.New(cfg.ProductCache.Redis)
+		if err != nil {
+			return fmt.Errorf("create product cache Redis client: %w", err)
+		}
+		defer cacheClient.Close()
+		repository, err = productcache.NewRepository(
+			repository, cacheClient, logger, cfg.ProductCache.TTL, cfg.ProductCache.OperationTimeout,
+		)
+		if err != nil {
+			return fmt.Errorf("create cached order repository: %w", err)
+		}
+	}
+	serviceTimeout := cfg.Database.OperationTimeout
+	if cfg.ProductCache.Enabled {
+		serviceTimeout += 2 * cfg.ProductCache.OperationTimeout
+	}
+	service, err := commerce.NewService(repository, logger, serviceTimeout)
 	if err != nil {
 		return fmt.Errorf("create commerce service: %w", err)
 	}

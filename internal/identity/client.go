@@ -23,7 +23,10 @@ import (
 	identityv1 "github.com/assumeengagetry/distributed-commerce/internal/genproto/identity/v1"
 )
 
-const identityServiceName = "identity.v1.IdentityService"
+const (
+	identityServiceName        = "identity.v1.IdentityService"
+	maximumClientMetadataBytes = 16 << 10
+)
 
 type ClientConfig struct {
 	Target        string
@@ -56,6 +59,7 @@ func Dial(config ClientConfig) (*Client, error) {
 		config.Target,
 		grpc.WithTransportCredentials(transportCredentials),
 		grpc.WithDisableRetry(),
+		grpc.WithMaxHeaderListSize(maximumClientMetadataBytes),
 		grpc.WithDefaultCallOptions(
 			grpc.MaxCallSendMsgSize(1<<20),
 			grpc.MaxCallRecvMsgSize(4<<20),

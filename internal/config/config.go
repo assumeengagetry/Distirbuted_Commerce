@@ -18,15 +18,17 @@ import (
 // Config contains all process configuration. Secrets remain in environment
 // variables and must not be logged with this struct.
 type Config struct {
-	Environment string
-	ServiceName string
-	HTTP        HTTPConfig
-	GRPC        GRPCConfig
-	Database    DatabaseConfig
-	Log         LogConfig
-	Auth        AuthConfig
-	Commerce    CommerceConfig
-	Payment     CommerceConfig
+	Environment  string
+	ServiceName  string
+	HTTP         HTTPConfig
+	GRPC         GRPCConfig
+	Database     DatabaseConfig
+	Log          LogConfig
+	Auth         AuthConfig
+	Commerce     CommerceConfig
+	Payment      CommerceConfig
+	ProductCache ProductCacheConfig
+	Jobs         JobClientConfig
 }
 
 type HTTPConfig struct {
@@ -265,73 +267,36 @@ func loadWithDefaults(lookup lookupEnv, defaultServiceName, defaultHTTPAddress s
 		return Config{}, fmt.Errorf("GRPC_CALL_TIMEOUT must be shorter than HTTP_WRITE_TIMEOUT")
 	}
 
-	maxConns, err := integer(lookup, "DB_MAX_CONNS", 20, 1, 200)
+	databaseConfig, err := loadDatabaseConfig(lookup, databaseURL, writeTimeout, isOrderService || isPaymentService)
 	if err != nil {
 		return Config{}, err
 	}
-	minIdleConns, err := integer(lookup, "DB_MIN_IDLE_CONNS", 2, 0, 200)
-	if err != nil {
-		return Config{}, err
+	var productCacheConfig ProductCacheConfig
+	if isOrderService {
+		productCacheConfig, err = loadProductCacheConfig(lookup, environment)
+		if err != nil {
+			return Config{}, err
+		}
 	}
-	if minIdleConns > maxConns {
-		return Config{}, fmt.Errorf("DB_MIN_IDLE_CONNS must not exceed DB_MAX_CONNS")
+	var jobClientConfig JobClientConfig
+	if isIdentityService {
+		jobClientConfig, err = loadJobClientConfig(lookup, environment)
+		if err != nil {
+			return Config{}, err
+		}
 	}
-
-	maxConnLifetime, err := positiveDuration(lookup, "DB_MAX_CONN_LIFETIME", time.Hour)
-	if err != nil {
-		return Config{}, err
-	}
-	maxConnLifetimeJitter, err := nonNegativeDuration(lookup, "DB_MAX_CONN_LIFETIME_JITTER", 5*time.Minute)
-	if err != nil {
-		return Config{}, err
-	}
-	if maxConnLifetimeJitter > maxConnLifetime {
-		return Config{}, fmt.Errorf("DB_MAX_CONN_LIFETIME_JITTER must not exceed DB_MAX_CONN_LIFETIME")
-	}
-	maxConnIdleTime, err := positiveDuration(lookup, "DB_MAX_CONN_IDLE_TIME", 30*time.Minute)
-	if err != nil {
-		return Config{}, err
-	}
-	healthCheckPeriod, err := positiveDuration(lookup, "DB_HEALTH_CHECK_PERIOD", time.Minute)
-	if err != nil {
-		return Config{}, err
-	}
-	pingTimeout, err := positiveDuration(lookup, "DB_PING_TIMEOUT", 2*time.Second)
-	if err != nil {
-		return Config{}, err
-	}
-	if pingTimeout > writeTimeout {
-		return Config{}, fmt.Errorf("DB_PING_TIMEOUT must not exceed HTTP_WRITE_TIMEOUT")
-	}
-	operationTimeout, err := boundedDuration(lookup, "DB_OPERATION_TIMEOUT", 5*time.Second, 500*time.Millisecond, 30*time.Second)
-	if err != nil {
-		return Config{}, err
-	}
-	if operationTimeout >= writeTimeout {
-		return Config{}, fmt.Errorf("DB_OPERATION_TIMEOUT must be shorter than HTTP_WRITE_TIMEOUT")
-	}
-	lockTimeout, err := boundedDuration(lookup, "DB_LOCK_TIMEOUT", 2*time.Second, 100*time.Millisecond, 10*time.Second)
-	if err != nil {
-		return Config{}, err
-	}
-	if lockTimeout >= operationTimeout {
-		return Config{}, fmt.Errorf("DB_LOCK_TIMEOUT must be shorter than DB_OPERATION_TIMEOUT")
-	}
-	commitResolutionTimeout, err := boundedDuration(
-		lookup, "DB_COMMIT_RESOLUTION_TIMEOUT", 2*time.Second, 100*time.Millisecond, 5*time.Second,
-	)
-	if err != nil {
-		return Config{}, err
-	}
-	if operationTimeout+commitResolutionTimeout >= writeTimeout {
-		return Config{}, fmt.Errorf("DB_OPERATION_TIMEOUT plus DB_COMMIT_RESOLUTION_TIMEOUT must be shorter than HTTP_WRITE_TIMEOUT")
-	}
-	requestBudget := readTimeout + operationTimeout + 500*time.Millisecond
+	requestBudget := readTimeout + databaseConfig.OperationTimeout + 500*time.Millisecond
 	if !isIdentityService {
-		requestBudget += grpcCallTimeout + commitResolutionTimeout
+		requestBudget += grpcCallTimeout + databaseConfig.CommitResolutionTimeout
+	}
+	if productCacheConfig.Enabled {
+		requestBudget += 2 * productCacheConfig.OperationTimeout
+	}
+	if jobClientConfig.Enabled {
+		requestBudget += jobClientConfig.EnqueueTimeout
 	}
 	if requestBudget >= writeTimeout {
-		return Config{}, fmt.Errorf("request read, gRPC, database, and response budgets must fit within HTTP_WRITE_TIMEOUT")
+		return Config{}, fmt.Errorf("request read, gRPC, database, Redis, enqueue, and response budgets must fit within HTTP_WRITE_TIMEOUT")
 	}
 
 	var authConfig AuthConfig
@@ -381,21 +346,88 @@ func loadWithDefaults(lookup lookupEnv, defaultServiceName, defaultHTTPAddress s
 			TLSCAFile: grpcTLSCAFile, TLSServerName: grpcTLSServerName,
 			TLSAllowedClientURIs: grpcTLSAllowedClientURIs,
 		},
-		Database: DatabaseConfig{
-			URL:                     databaseURL,
-			MaxConns:                maxConns,
-			MinIdleConns:            minIdleConns,
-			MaxConnLifetime:         maxConnLifetime,
-			MaxConnLifetimeJitter:   maxConnLifetimeJitter,
-			MaxConnIdleTime:         maxConnIdleTime,
-			HealthCheckPeriod:       healthCheckPeriod,
-			PingTimeout:             pingTimeout,
-			OperationTimeout:        operationTimeout,
-			LockTimeout:             lockTimeout,
-			CommitResolutionTimeout: commitResolutionTimeout,
-		},
-		Log:  LogConfig{Level: logLevel},
-		Auth: authConfig, Commerce: commerceConfig, Payment: paymentConfig,
+		Database: databaseConfig,
+		Log:      LogConfig{Level: logLevel},
+		Auth:     authConfig, Commerce: commerceConfig, Payment: paymentConfig,
+		ProductCache: productCacheConfig, Jobs: jobClientConfig,
+	}, nil
+}
+
+func loadDatabaseConfig(
+	lookup lookupEnv,
+	databaseURL string,
+	writeTimeout time.Duration,
+	includeCommitResolution bool,
+) (DatabaseConfig, error) {
+	maxConns, err := integer(lookup, "DB_MAX_CONNS", 20, 1, 200)
+	if err != nil {
+		return DatabaseConfig{}, err
+	}
+	minIdleConns, err := integer(lookup, "DB_MIN_IDLE_CONNS", 2, 0, 200)
+	if err != nil {
+		return DatabaseConfig{}, err
+	}
+	if minIdleConns > maxConns {
+		return DatabaseConfig{}, fmt.Errorf("DB_MIN_IDLE_CONNS must not exceed DB_MAX_CONNS")
+	}
+	maxConnLifetime, err := positiveDuration(lookup, "DB_MAX_CONN_LIFETIME", time.Hour)
+	if err != nil {
+		return DatabaseConfig{}, err
+	}
+	maxConnLifetimeJitter, err := nonNegativeDuration(lookup, "DB_MAX_CONN_LIFETIME_JITTER", 5*time.Minute)
+	if err != nil {
+		return DatabaseConfig{}, err
+	}
+	if maxConnLifetimeJitter > maxConnLifetime {
+		return DatabaseConfig{}, fmt.Errorf("DB_MAX_CONN_LIFETIME_JITTER must not exceed DB_MAX_CONN_LIFETIME")
+	}
+	maxConnIdleTime, err := positiveDuration(lookup, "DB_MAX_CONN_IDLE_TIME", 30*time.Minute)
+	if err != nil {
+		return DatabaseConfig{}, err
+	}
+	healthCheckPeriod, err := positiveDuration(lookup, "DB_HEALTH_CHECK_PERIOD", time.Minute)
+	if err != nil {
+		return DatabaseConfig{}, err
+	}
+	pingTimeout, err := positiveDuration(lookup, "DB_PING_TIMEOUT", 2*time.Second)
+	if err != nil {
+		return DatabaseConfig{}, err
+	}
+	if writeTimeout > 0 && pingTimeout > writeTimeout {
+		return DatabaseConfig{}, fmt.Errorf("DB_PING_TIMEOUT must not exceed HTTP_WRITE_TIMEOUT")
+	}
+	operationTimeout, err := boundedDuration(lookup, "DB_OPERATION_TIMEOUT", 5*time.Second, 500*time.Millisecond, 30*time.Second)
+	if err != nil {
+		return DatabaseConfig{}, err
+	}
+	if writeTimeout > 0 && operationTimeout >= writeTimeout {
+		return DatabaseConfig{}, fmt.Errorf("DB_OPERATION_TIMEOUT must be shorter than HTTP_WRITE_TIMEOUT")
+	}
+	lockTimeout, err := boundedDuration(lookup, "DB_LOCK_TIMEOUT", 2*time.Second, 100*time.Millisecond, 10*time.Second)
+	if err != nil {
+		return DatabaseConfig{}, err
+	}
+	if lockTimeout >= operationTimeout {
+		return DatabaseConfig{}, fmt.Errorf("DB_LOCK_TIMEOUT must be shorter than DB_OPERATION_TIMEOUT")
+	}
+	var commitResolutionTimeout time.Duration
+	if includeCommitResolution {
+		commitResolutionTimeout, err = boundedDuration(
+			lookup, "DB_COMMIT_RESOLUTION_TIMEOUT", 2*time.Second, 100*time.Millisecond, 5*time.Second,
+		)
+		if err != nil {
+			return DatabaseConfig{}, err
+		}
+		if writeTimeout > 0 && operationTimeout+commitResolutionTimeout >= writeTimeout {
+			return DatabaseConfig{}, fmt.Errorf("DB_OPERATION_TIMEOUT plus DB_COMMIT_RESOLUTION_TIMEOUT must be shorter than HTTP_WRITE_TIMEOUT")
+		}
+	}
+	return DatabaseConfig{
+		URL: databaseURL, MaxConns: maxConns, MinIdleConns: minIdleConns,
+		MaxConnLifetime: maxConnLifetime, MaxConnLifetimeJitter: maxConnLifetimeJitter,
+		MaxConnIdleTime: maxConnIdleTime, HealthCheckPeriod: healthCheckPeriod,
+		PingTimeout: pingTimeout, OperationTimeout: operationTimeout,
+		LockTimeout: lockTimeout, CommitResolutionTimeout: commitResolutionTimeout,
 	}, nil
 }
 

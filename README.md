@@ -1,8 +1,8 @@
 # Distributed Commerce Platform
 
-A production-oriented Go microservice portfolio project built incrementally around transactional commerce workflows. The repository currently implements **Phase 5**: the service foundation, user authentication, catalog/inventory, idempotent orders/payments, and deadline-bound protobuf/gRPC identity communication.
+A production-oriented Go microservice portfolio project built incrementally around transactional commerce workflows. The repository currently implements **Phase 6**: the service foundation, user authentication, catalog/inventory, idempotent orders/payments, deadline-bound protobuf/gRPC identity communication, a fail-open Redis product cache, and retrying Asynq maintenance jobs.
 
-External payment providers, refunds, cancellation/restock workflows, Redis application integration, asynchronous jobs, metrics, and tracing are intentionally not claimed as implemented yet.
+External payment providers, refunds, cancellation/restock workflows, transactional outbox delivery, metrics, and tracing are intentionally not claimed as implemented yet.
 
 ## Current Status
 
@@ -38,9 +38,12 @@ Implemented:
 - Loopback-only local gRPC plus production TLS 1.3 mTLS and SPIFFE URI client allowlisting
 - PASETO key isolation: only user-service can load the symmetric key
 - Loopback-only local HTTP and mandatory TLS 1.3 certificate configuration in production
+- Cache-aside public product detail reads with PostgreSQL fallback, TTL, generation-fenced fill, and post-write invalidation
+- A separate Asynq worker for bounded expired-session cleanup with uniqueness, retries, archive handling, and single-task recovery tooling
+- Process-owned Redis configuration, loopback-only plaintext, and verified TLS support in production
 - PostgreSQL-backed readiness, process liveness, and signal-aware graceful shutdown
 - Rootless PostgreSQL and Redis infrastructure using Podman Quadlet and systemd user units
-- Unit, HTTP, race, and real PostgreSQL integration tests
+- Unit, HTTP, race, and real PostgreSQL/Redis integration tests
 
 ## Architecture
 
@@ -62,16 +65,19 @@ flowchart LR
     UserService --> Passwords[Argon2id]
     UserService --> Tokens
     UserService --> UserRepository[User Repository]
-    OrderService --> OrderRepository[Order Repository]
+    UserService --> JobClient[Asynq Client]
+    OrderService --> ProductCache[Product Cache Decorator]
+    ProductCache --> OrderRepository[Order Repository]
     PaymentService --> PaymentRepository[Payment Repository]
+    JobClient --> QueueRedis[(Redis DB 1 / Asynq)]
+    QueueRedis --> Worker[Job Worker]
+    Worker --> UserRepository
+    ProductCache --> CacheRedis[(Redis DB 0 / Cache)]
     UserRepository --> SQLC[sqlc Queries]
     OrderRepository --> SQLC
     PaymentRepository --> SQLC
     SQLC --> PostgreSQL[(PostgreSQL)]
     Migrations[golang-migrate] --> PostgreSQL
-    Redis[(Redis)]:::future
-
-    classDef future stroke-dasharray: 5 5
 ```
 
 The dependency direction is:
@@ -80,7 +86,7 @@ The dependency direction is:
 Gin transport -> domain service -> repository interface <- PostgreSQL implementation
 ```
 
-Gin and gRPC remain transport adapters around typed boundaries. The three processes share PostgreSQL for the Phase 4 monetary transaction, but only user-service receives the PASETO key. Order/payment authenticate through user-service before entering domain code, then recheck current role/status in PostgreSQL. No RPC occurs inside a database transaction. Redis remains outside application behavior until Phase 6.
+Gin and gRPC remain transport adapters around typed boundaries. The three API processes share PostgreSQL for the Phase 4 monetary transaction, but only user-service receives the PASETO key. Order/payment authenticate through user-service before entering domain code, then recheck current role/status in PostgreSQL. No RPC, Redis call, or task enqueue occurs inside a database transaction. Cache failures fall back to PostgreSQL; queue enqueue failures cannot reverse committed authentication work.
 
 ## Project Layout
 
@@ -89,12 +95,17 @@ Gin and gRPC remain transport adapters around typed boundaries. The three proces
 ├── cmd/user-service/          # User/auth process composition
 ├── cmd/order-service/         # Product/inventory/order process composition
 ├── cmd/payment-service/       # Account debit/payment process composition
+├── cmd/job-worker/            # Asynq maintenance worker composition
+├── cmd/job-admin/             # Restricted archived-task operations
 ├── internal/auth/             # Argon2id, PASETO, refresh tokens, principal context
 ├── internal/user/             # Models, business rules, service, repository boundary
 ├── internal/order/            # Catalog, inventory, order rules and repository boundary
 ├── internal/payment/          # Payment rules and repository boundary
 ├── internal/idempotency/      # Key validation and canonical request hashing
 ├── internal/identity/         # Deadline-bound identity gRPC client
+├── internal/jobs/             # Versioned task client, handlers, retries, logging
+├── internal/productcache/     # Generation-fenced Redis repository decorator
+├── internal/redisclient/      # Bounded Redis client and TLS construction
 ├── internal/genproto/         # Committed generated protobuf/gRPC Go code
 ├── internal/config/           # Environment parsing and validation
 ├── internal/database/         # pgx pool, PostgreSQL repository, generated sqlc
@@ -128,7 +139,7 @@ Gin and gRPC remain transport adapters around typed boundaries. The three proces
 | SQL generation | sqlc 1.31 |
 | Migration | golang-migrate 4.18 |
 | Local containers | Rootless Podman Quadlet |
-| Future cache/queue infrastructure | Redis 7.4 |
+| Cache and queue | Redis 7.4, go-redis 9.22, Asynq 0.26 |
 | Logging | Standard library `log/slog` |
 | Service manager | systemd user services |
 
@@ -217,6 +228,25 @@ User-service listens on `127.0.0.1:9091` locally and implements `identity.v1.Ide
 | `grpc.health.v1.Health/Check` | order/payment readiness | Report identity RPC serving state | Non-serving/unavailable marks only `identity_grpc` down |
 
 The client derives a one-second deadline from the HTTP request context, preserves shorter parent deadlines, caps messages/metadata, and disables configured gRPC retries. The RPC finishes before domain/repository execution. Server requests also receive a two-second upper bound. Generated files are committed under `internal/genproto`; pinned generation is compared byte-for-byte, and Buf breaking checks against the human-readable `api/proto-baseline` contract.
+
+## Redis Cache And Jobs
+
+Only the public `GET /v1/products/:product_id` path uses Redis. A validated cache hit returns the internal product DTO; a miss, malformed entry, timeout, or Redis outage reads PostgreSQL. List pages, admin reads, order pricing, version checks, and inventory decisions always use PostgreSQL.
+
+Each cached or mutated product has a value key with a 30-second default TTL and a persistent generation key. A miss allocates a candidate generation in memory, but initializes the Redis generation only after PostgreSQL returns a valid product, so repeated `404` reads leave no persistent keys. Cache fills use a Lua compare-and-set against the generation observed before the database read. Successful product writes, inventory mutations, and successful or outcome-unknown orders atomically replace generation tokens and delete affected values after repository work, preventing an older concurrent miss from repopulating invalidated data. Redis is deliberately absent from HTTP readiness because PostgreSQL remains authoritative.
+
+Successful register, login, and refresh operations try to enqueue one delayed, versioned `auth:prune-expired-sessions:v1` task after commit when queue settings are enabled. The delay keeps the uniqueness lock for the one-minute coalescing window. When the queue is disabled or enqueue fails, user-service falls back to one bounded PostgreSQL cleanup batch without changing the committed authentication result. The worker also schedules the same idempotent task every minute, uses PostgreSQL time for expiry, drains full batches within a ten-second execution cap, and retries ordinary database errors up to five times with exponential backoff. Invalid payloads skip retries and are archived immediately. The worker never receives the PASETO key or exposes an HTTP port.
+
+Inspect and recover archived tasks without exposing payloads:
+
+```bash
+make jobs-failed
+make jobs-failed PAGE=2
+make jobs-retry ID=<task-id>
+make jobs-delete ID=<task-id>
+```
+
+Only single-task retry/delete operations are provided. Asynq delivery is at-least-once, and this maintenance task is idempotent. Future authoritative external side effects require a PostgreSQL transactional outbox rather than best-effort enqueue.
 
 ## Database Schema
 
@@ -462,7 +492,7 @@ Users have `customer` or `admin` roles. Self-registration always creates a `cust
 - OpenSSL
 - A working systemd user session
 
-No Docker daemon, Docker CLI, or Docker Compose is used. Quadlet pulls PostgreSQL and Redis images through AWS Public ECR.
+No Docker daemon, Docker CLI, or Docker Compose is used. Quadlet pulls digest-pinned PostgreSQL and Redis images through AWS Public ECR.
 
 ### Run
 
@@ -485,9 +515,15 @@ In a third terminal:
 make run-payment
 ```
 
+In a fourth terminal:
+
+```bash
+make run-worker
+```
+
 `make init` creates `.env`, PostgreSQL/Redis credentials, a Redis ACL file, and a random PASETO key under `.secrets/`, all with owner-only permissions. These paths are ignored by Git. Rerunning it preserves existing random credentials and normalizes their permissions.
 
-`make infra-up` installs the Quadlets, waits for PostgreSQL/Redis, and creates the isolated database named by `TEST_DATABASE_URL` when absent. Rootless `pasta` publishes infrastructure only on loopback. User, order, and payment HTTP default to `127.0.0.1:8081`, `:8082`, and `:8083`; user-service also binds identity gRPC on `127.0.0.1:9091`. Start user-service first. Local plaintext HTTP/gRPC is accepted only on loopback.
+`make infra-up` installs the Quadlets, waits for PostgreSQL/Redis, and creates the isolated database named by `TEST_DATABASE_URL` when absent. Rootless `pasta` publishes infrastructure only on loopback. Local Redis uses AOF, a 192 MiB `noeviction` limit, DB 0 for cache data, DB 1 for Asynq, and DB 15 for destructive tests. User, order, and payment HTTP default to `127.0.0.1:8081`, `:8082`, and `:8083`; user-service also binds identity gRPC on `127.0.0.1:9091`. Start user-service first, then consumers and the worker. Local plaintext HTTP/gRPC/Redis is accepted only on loopback.
 
 The tool targets build pinned `golang-migrate`, sqlc, Buf, protobuf generators, and govulncheck into the ignored `bin/` directory. The Go toolchain honors the configured `GOPROXY`.
 
@@ -503,7 +539,7 @@ make infra-down
 | --- | --- | --- | --- |
 | `DATABASE_URL` | yes | none | PostgreSQL connection URL |
 | `TEST_DATABASE_URL` | integration only | none | Disposable non-production database; its PostgreSQL system identifier/database OID must differ from `DATABASE_URL` |
-| `PASETO_V4_LOCAL_KEY` | user only | none | 32-byte v4.local key; rejected by order/payment |
+| `PASETO_V4_LOCAL_KEY` | user only | none | 32-byte v4.local key; rejected by order/payment/worker |
 | `APP_ENV` | no | `local` | `local`, `test`, or `production` |
 | `SERVICE_NAME` | no | process-specific | Structured log and health response service name |
 | `HTTP_ADDR` | no | user `:8081`, order `:8082`, payment `:8083` | Process-specific loopback listen address |
@@ -519,6 +555,29 @@ make infra-down
 | `GRPC_TLS_CA_FILE` | production | none | Internal CA used to verify the peer |
 | `GRPC_TLS_SERVER_NAME` | order/payment production | none | Identity server DNS SAN to verify |
 | `GRPC_TLS_ALLOWED_CLIENT_URIS` | user production | none | Comma-separated allowed order/payment SPIFFE URI SANs |
+| `CACHE_REDIS_ADDR` | order cache | disabled | Product-cache Redis host and port; plaintext is loopback-only |
+| `CACHE_REDIS_USERNAME` | with cache | `commerce` | Product-cache Redis ACL user |
+| `CACHE_REDIS_PASSWORD` | with cache | none | Product-cache Redis password; locally injected from `.secrets/` |
+| `CACHE_REDIS_DB` | with cache | `0` | Local product-cache logical database |
+| `QUEUE_REDIS_ADDR` | user/worker jobs | disabled for user, required for worker | Asynq Redis host and port; plaintext is loopback-only |
+| `QUEUE_REDIS_USERNAME` | with jobs | `commerce` | Queue Redis ACL user |
+| `QUEUE_REDIS_PASSWORD` | with jobs | none | Queue Redis password; locally injected from `.secrets/` |
+| `QUEUE_REDIS_DB` | with jobs | `1` | Local Asynq logical database |
+| `CACHE_REDIS_*_TIMEOUT`, `QUEUE_REDIS_*_TIMEOUT` | no | bounded per operation | Dial/read/write/pool Redis limits |
+| `CACHE_REDIS_POOL_SIZE`, `QUEUE_REDIS_POOL_SIZE` | no | `10` | Per-process Redis connection pool size |
+| `*_REDIS_TLS_CA_FILE`, `*_REDIS_TLS_SERVER_NAME` | production Redis | none | Verified Redis server TLS; TLS 1.3 minimum |
+| `*_REDIS_TLS_CERT_FILE`, `*_REDIS_TLS_KEY_FILE` | optional pair | none | Optional Redis client certificate and key |
+| `PRODUCT_CACHE_TTL` | order cache | `30s` | Maximum product value lifetime |
+| `PRODUCT_CACHE_OPERATION_TIMEOUT` | order cache | `100ms` | Bound for cache read/fill/invalidation work |
+| `JOB_QUEUE` | jobs | `maintenance` | Validated Asynq queue name |
+| `JOB_ENQUEUE_TIMEOUT` | user jobs | `250ms` | Detached post-commit enqueue bound |
+| `JOB_TASK_TIMEOUT` | jobs | `10s` | Asynq execution deadline |
+| `JOB_UNIQUE_TTL` | user jobs | `1m` | Cleanup enqueue coalescing window |
+| `JOB_WORKER_CONCURRENCY` | worker | `4` | Maximum simultaneous task handlers |
+| `JOB_WORKER_SHUTDOWN_TIMEOUT` | worker | `15s` | Active-task drain bound |
+| `JOB_CLEANUP_INTERVAL` | worker | `1m` | Periodic session-cleanup enqueue interval |
+| `SESSION_CLEANUP_BATCH_SIZE` | worker | `100` | Maximum sessions deleted by one database batch |
+| `TEST_REDIS_ADDR`, `TEST_REDIS_DB` | integration only | loopback, `15` | Disposable Redis target; the test DB is flushed |
 | `ACCESS_TOKEN_TTL` | no | `15m` | Access-token lifetime |
 | `REFRESH_TOKEN_TTL` | no | `168h` | Absolute session/refresh lifetime |
 | `TOKEN_CLOCK_SKEW` | no | `30s` | Maximum accepted clock skew |
@@ -541,7 +600,7 @@ make infra-down
 | `ORDER_HTTP_ADDR` | make target only | `127.0.0.1:8082` | `make run-order` listen override |
 | `PAYMENT_HTTP_ADDR` | make target only | `127.0.0.1:8083` | `make run-payment` listen override |
 
-Each process parses only settings it owns: auth for user, commerce limits for order, and payment limits for payment. Common request budgets ensure gRPC authentication plus database work and ambiguous-commit resolution leave response time inside `HTTP_WRITE_TIMEOUT`. Production requires PostgreSQL `sslmode=verify-full`, native HTTPS, and gRPC mTLS. The order/payment Make targets need only `pgpass`, explicitly unset the PASETO key, and use `ORDER_HTTP_ADDR`/`PAYMENT_HTTP_ADDR`.
+Each process parses only settings it owns: auth and enqueue settings for user, commerce/cache settings for order, payment limits for payment, and database/worker settings for job-worker. Common request budgets include gRPC, PostgreSQL, Redis, enqueue, ambiguous-commit resolution, and response margin inside `HTTP_WRITE_TIMEOUT`. Production requires PostgreSQL `sslmode=verify-full`, native HTTPS, gRPC mTLS, and verified Redis TLS when cache/jobs are enabled. Production should use separate Redis endpoints for cache and durable queues; local logical DB separation is not a security or resource-isolation boundary.
 
 ### Phase 5 Rollout
 
@@ -549,6 +608,14 @@ Each process parses only settings it owns: auth for user, commerce limits for or
 2. Deploy user-service first with HTTP TLS, `GRPC_ADDR`, its PASETO key, server certificate/key, CA, and client URI allowlist. Verify both `:8081/readyz` checks and standard gRPC health.
 3. Remove `PASETO_V4_LOCAL_KEY` from order/payment environments, configure their client certificate/key, CA, server name, and identity target, then deploy them independently. Do not send traffic until each `/readyz` reports both dependencies up and an authenticated request succeeds through gRPC.
 4. During rollback, keep Phase 5 user-service/gRPC available. A Phase 4 order/payment binary requires temporarily restoring the PASETO key; a Phase 5 consumer intentionally refuses to start while that key is present.
+
+### Phase 6 Rollout
+
+1. Provision cache and queue Redis endpoints with ACL credentials, persistence/no-eviction for Asynq, bounded memory, and verified TLS in production. Keep their failure domains separate outside local development.
+2. Deploy `job-worker` first and verify its startup PostgreSQL/Redis pings. Deploy user-service with queue settings; authentication remains available if enqueue later fails.
+3. Deploy order-service with cache settings. Warm a product detail, mutate inventory, and verify the next detail read reflects PostgreSQL. Redis is not an order-service readiness dependency.
+4. Inspect `make jobs-failed` during rollout. Retry or delete only after classifying the underlying error; neither operation accepts a bulk wildcard.
+5. Roll back order-service by setting `CACHE_REDIS_ADDR` empty, and user-service by setting `QUEUE_REDIS_ADDR` empty. The local Make targets honor an explicitly empty address, and user-service then uses bounded inline session cleanup. Stop the worker only after older queued maintenance tasks are drained or intentionally archived.
 
 ## Testing
 
@@ -560,7 +627,7 @@ make check
 make release-check
 ```
 
-`make test-integration` forcibly drops and recreates `TEST_DATABASE_URL`. Before any drop, the safety gate verifies that its PostgreSQL system identifier and database OID differ from `DATABASE_URL`, and it refuses to run when normalized `APP_ENV` is `production`. Never point `TEST_DATABASE_URL` at data that must be retained.
+`make test-integration` forcibly drops and recreates `TEST_DATABASE_URL` and flushes `TEST_REDIS_DB`. Before any database drop, the safety gate requires the application database name plus `_test`, a project-owned disposable marker, and a PostgreSQL system identifier/database OID distinct from `DATABASE_URL`. A test database created before the Phase 6 marker gate is intentionally not adopted automatically; inspect it and explicitly drop/recreate it as disposable before continuing. The Redis test requires a loopback address and DB number 2-15 numerically distinct from configured cache/queue DBs. The target refuses normalized `APP_ENV=production`. Never point either test target at data that must be retained.
 
 Coverage includes:
 
@@ -586,6 +653,8 @@ Coverage includes:
 - Identity protobuf server/client behavior, deadlines, cancellation, malformed principals, health, and outage-to-HTTP mapping
 - Real TLS 1.3 mTLS handshakes for allowed/unlisted SPIFFE clients and server-name mismatch
 - gRPC-backed order/payment HTTP integration plus listener outage/recovery smoke
+- Product cache miss/fill/hit, TTL, malformed-entry repair, Redis outage fallback, write invalidation, and stale-fill generation races
+- Deterministic Asynq payloads, uniqueness, detached enqueue, strict permanent-error classification, transient retries, archive/retry/delete, and real Redis worker processing
 - Pinned protobuf/sqlc generation, module tidiness, race/vet/build checks, and reachable-vulnerability scanning
 - Empty-database migration up/down/up validation and serialized cross-package PostgreSQL integration tests
 
@@ -598,7 +667,7 @@ CI and benchmark reporting are Phase 8 work. No performance data is invented.
 - **Database concurrency control:** refresh serialization uses PostgreSQL row locks, not a Go mutex, so it works across replicas.
 - **Deterministic order locking:** product and inventory rows are acquired in sorted UUID order; atomic conditional updates are the final overselling guard.
 - **Immutable order history:** names, SKUs, versions, unit prices, and line totals are copied into order items while product rows are locked.
-- **Separate composition roots:** user, order, and payment APIs run as distinct processes while sharing narrowly scoped platform/auth/database packages.
+- **Separate composition roots:** user, order, and payment APIs plus the maintenance worker run as distinct processes while sharing narrowly scoped packages.
 - **Database-backed idempotency:** successful keys, request hashes, and resource IDs commit atomically with mutations; raw keys are not stored.
 - **Order-before-account payment locks:** same-order races resolve before account debit, while account locks prevent cross-order overdrafts.
 - **No network calls in transactions:** password hashing and external operations remain outside database transactions.
@@ -608,7 +677,10 @@ CI and benchmark reporting are Phase 8 work. No performance data is invented.
 - **Small interfaces at consumers:** the service owns its repository boundary; transport owns its service/token boundaries for focused tests.
 - **No global mutable state:** configuration, keys, logger, pool, limiter, and services are constructed in `main`.
 - **Strict transport boundary:** Gin parses HTTP and maps errors; business rules receive `context.Context` and domain requests.
-- **Redis is not authoritative:** it is provisioned but unused by Phase 5 application code.
+- **Redis is not authoritative:** cache failures fall back to PostgreSQL, and cache data never drives pricing, authorization, inventory, or payment decisions.
+- **Generation-fenced cache fills:** post-write generation replacement prevents a slow pre-write miss from restoring stale product data.
+- **At-least-once maintenance jobs:** expired-session deletion is idempotent; invalid payloads archive immediately and transient database errors retry.
+- **No pretend event durability:** best-effort session-cleanup enqueue is acceptable maintenance. Authoritative external side effects require a transactional outbox.
 
 ## Security Baseline
 
@@ -623,6 +695,8 @@ CI and benchmark reporting are Phase 8 work. No performance data is invented.
 - Idempotency keys are validated, hashed before persistence, and never logged.
 - Bearer values are never logged by gRPC adapters; dependency diagnostics contain target/code/cause only.
 - Production identity RPC uses TLS 1.3 mTLS plus an exact SPIFFE URI client allowlist.
+- Redis plaintext is loopback-only; production cache/queue clients require a trusted CA and server name with TLS 1.3 minimum.
+- Cache and task payload schemas are versioned and strictly validated; task errors never log payloads or Redis passwords.
 - gRPC limits request/response/metadata sizes, concurrent streams, server execution time, and graceful drain time.
 - `release-check` runs govulncheck and fails on vulnerabilities reachable through application call paths.
 - Logout and confirmed replay revocation use short independent deadlines so client cancellation cannot undo the security action.
@@ -636,7 +710,7 @@ CI and benchmark reporting are Phase 8 work. No performance data is invented.
 3. **Phase 3 complete:** products, inventory, transactional order creation/history, and overselling concurrency tests.
 4. **Phase 4 complete:** account debit, payment transactions, paid-order transition, and order/payment idempotency.
 5. **Phase 5 complete:** versioned identity protobuf, deadline-bound gRPC auth, mTLS, health, and coordinated lifecycle.
-6. **Phase 6:** Redis product cache, Asynq jobs, retries, and failed task handling.
+6. **Phase 6 complete:** fail-open Redis product cache, generation-fenced invalidation, Asynq maintenance jobs, retries, archive handling, and recovery tooling.
 7. **Phase 7:** Prometheus metrics and OpenTelemetry traces.
 8. **Phase 8:** production images, Kubernetes, OpenAPI, CI, benchmarks, and final portfolio documentation.
 
@@ -649,8 +723,11 @@ CI and benchmark reporting are Phase 8 work. No performance data is invented.
 - Pending orders consume inventory; cancellation, expiry, payment-failure records, refunds, and compensating restock are not implemented.
 - User, order, and payment services still share PostgreSQL so the account debit, payment ledger, and order transition remain one transaction; extracting those data owners requires an explicit saga/outbox design.
 - Order/payment availability now depends on identity gRPC for protected requests. They fail closed with `503`; public catalog and process liveness remain available.
+- Product detail cache freshness is bounded by a short TTL when Redis invalidation fails; list/admin/order paths remain uncached and authoritative.
+- Request-triggered session cleanup enqueue is best-effort and has no transactional outbox. A bounded inline cleanup handles disabled or failed enqueue, the worker's periodic schedule drains larger backlogs, and expired sessions are already rejected by database checks.
+- Asynq and cache use separate logical Redis databases locally but should use separate instances in production because queue durability and cache eviction have different requirements.
 - PASETO remains symmetric, but only user-service holds the key. A user-service key compromise still grants token minting authority.
 - Email verification, password reset, MFA, account deletion, and audit history are not implemented.
-- Redis is provisioned but not consumed by application code yet.
 - The local PostgreSQL bootstrap role owns the development database; separate production migrator/runtime roles arrive with production deployment work.
+- A fresh database has no administrator bootstrap or customer funding command, so the documented HTTP examples alone cannot complete an admin-create-to-payment walkthrough.
 - Metrics and tracing are not represented as completed features.
