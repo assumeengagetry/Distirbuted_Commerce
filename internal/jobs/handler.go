@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/hibiken/asynq"
+
+	"github.com/assumeengagetry/distributed-commerce/internal/observability"
 )
 
 const sessionCleanupSchema = 1
@@ -31,9 +33,15 @@ type Handler struct {
 	databaseTimeout time.Duration
 	taskTimeout     time.Duration
 	batchSize       int32
+	telemetry       jobTelemetry
 }
 
-func NewHandler(repository SessionRepository, logger *slog.Logger, cfg HandlerConfig) (*Handler, error) {
+func NewHandler(
+	repository SessionRepository,
+	logger *slog.Logger,
+	cfg HandlerConfig,
+	providers observability.Providers,
+) (*Handler, error) {
 	if repository == nil {
 		return nil, fmt.Errorf("session repository is required")
 	}
@@ -49,12 +57,17 @@ func NewHandler(repository SessionRepository, logger *slog.Logger, cfg HandlerCo
 	if cfg.BatchSize <= 0 {
 		return nil, fmt.Errorf("session cleanup batch size must be positive")
 	}
+	telemetry, err := newJobTelemetry(providers)
+	if err != nil {
+		return nil, err
+	}
 	return &Handler{
 		repository:      repository,
 		logger:          logger,
 		databaseTimeout: cfg.DatabaseTimeout,
 		taskTimeout:     cfg.TaskTimeout,
 		batchSize:       cfg.BatchSize,
+		telemetry:       telemetry,
 	}, nil
 }
 
@@ -67,6 +80,9 @@ func (h *Handler) Register(mux *asynq.ServeMux) {
 			return next.ProcessTask(ctx, task)
 		})
 	})
+	if h.telemetry.enabled {
+		mux.Use(h.telemetry.middleware())
+	}
 	mux.HandleFunc(SessionCleanupTaskType, h.HandleSessionCleanup)
 }
 
@@ -89,6 +105,7 @@ func (h *Handler) HandleSessionCleanup(ctx context.Context, task *asynq.Task) er
 		if deleted < 0 || deleted > int64(h.batchSize) {
 			return fmt.Errorf("delete expired sessions: unexpected row count %d", deleted)
 		}
+		h.telemetry.recordDeletedSessions(ctx, deleted)
 		totalDeleted += deleted
 		if deleted < int64(h.batchSize) {
 			break

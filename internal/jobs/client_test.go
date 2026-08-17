@@ -8,6 +8,8 @@ import (
 	"github.com/alicebob/miniredis/v2"
 	"github.com/hibiken/asynq"
 	"github.com/redis/go-redis/v9"
+
+	"github.com/assumeengagetry/distributed-commerce/internal/observability"
 )
 
 func TestNewClientValidation(t *testing.T) {
@@ -35,13 +37,13 @@ func TestNewClientValidation(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if client, err := NewClient(test.client, test.cfg); err == nil || client != nil {
+			if client, err := NewClient(test.client, test.cfg, observability.NoopProviders()); err == nil || client != nil {
 				t.Fatalf("NewClient() = (%v, %v), want (nil, error)", client, err)
 			}
 		})
 	}
 
-	if client, err := NewClient(redisClient, valid); err != nil || client == nil {
+	if client, err := NewClient(redisClient, valid, observability.NoopProviders()); err != nil || client == nil {
 		t.Fatalf("NewClient() = (%v, %v), want a client", client, err)
 	}
 }
@@ -49,7 +51,7 @@ func TestNewClientValidation(t *testing.T) {
 func TestScheduleSessionCleanupEnqueuesDeterministicUniqueTask(t *testing.T) {
 	_, redisClient := newTestRedis(t)
 	cfg := testClientConfig()
-	client, err := NewClient(redisClient, cfg)
+	client, err := NewClient(redisClient, cfg, observability.NoopProviders())
 	if err != nil {
 		t.Fatalf("NewClient() error = %v", err)
 	}
@@ -91,7 +93,7 @@ func TestScheduleSessionCleanupEnqueuesDeterministicUniqueTask(t *testing.T) {
 func TestScheduleSessionCleanupDetachesCanceledParent(t *testing.T) {
 	_, redisClient := newTestRedis(t)
 	cfg := testClientConfig()
-	client, err := NewClient(redisClient, cfg)
+	client, err := NewClient(redisClient, cfg, observability.NoopProviders())
 	if err != nil {
 		t.Fatalf("NewClient() error = %v", err)
 	}

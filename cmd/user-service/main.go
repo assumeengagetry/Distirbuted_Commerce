@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -21,6 +22,7 @@ import (
 	"github.com/assumeengagetry/distributed-commerce/internal/observability"
 	"github.com/assumeengagetry/distributed-commerce/internal/platform/grpcserver"
 	"github.com/assumeengagetry/distributed-commerce/internal/platform/httpserver"
+	"github.com/assumeengagetry/distributed-commerce/internal/platform/metricsserver"
 	"github.com/assumeengagetry/distributed-commerce/internal/platform/process"
 	"github.com/assumeengagetry/distributed-commerce/internal/redisclient"
 	grpctransport "github.com/assumeengagetry/distributed-commerce/internal/transport/grpc"
@@ -36,7 +38,7 @@ func main() {
 	}
 }
 
-func run() error {
+func run() (result error) {
 	cfg, err := config.LoadForService("user-service", "127.0.0.1:8081")
 	if err != nil {
 		return err
@@ -49,8 +51,18 @@ func run() error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	telemetryRuntime, err := observability.NewRuntime(ctx, cfg.Telemetry, cfg.ServiceName, cfg.Environment)
+	if err != nil {
+		return fmt.Errorf("create telemetry runtime: %w", err)
+	}
+	defer func() {
+		if err := telemetryRuntime.ShutdownWithin(cfg.Telemetry.ShutdownTimeout); err != nil {
+			result = errors.Join(result, fmt.Errorf("shutdown telemetry: %w", err))
+		}
+	}()
+	telemetry := telemetryRuntime.Providers()
 
-	pool, err := database.Open(ctx, cfg.Database)
+	pool, err := database.Open(ctx, cfg.Database, telemetry)
 	if err != nil {
 		return fmt.Errorf("open database: %w", err)
 	}
@@ -96,10 +108,13 @@ func run() error {
 			return fmt.Errorf("create queue Redis client: %w", err)
 		}
 		defer queueRedis.Close()
+		if err := redisclient.Instrument(queueRedis, telemetry, "queue", false); err != nil {
+			return fmt.Errorf("instrument queue Redis client: %w", err)
+		}
 		cleanupScheduler, err = jobs.NewClient(queueRedis, jobs.ClientConfig{
 			Queue: cfg.Jobs.Queue, EnqueueTimeout: cfg.Jobs.EnqueueTimeout,
 			TaskTimeout: cfg.Jobs.TaskTimeout, UniqueTTL: cfg.Jobs.UniqueTTL,
-		})
+		}, telemetry)
 		if err != nil {
 			return fmt.Errorf("create job client: %w", err)
 		}
@@ -142,7 +157,8 @@ func run() error {
 			EntryTTL:          cfg.Auth.RateLimit.EntryTTL,
 			MaxEntries:        cfg.Auth.RateLimit.MaxEntries,
 		},
-		Now: time.Now,
+		Now:       time.Now,
+		Telemetry: telemetry,
 	})
 	if err != nil {
 		return fmt.Errorf("create HTTP router: %w", err)
@@ -157,9 +173,12 @@ func run() error {
 			return httpserver.Serve(ctx, cfg.HTTP, logger, router, stop)
 		},
 		func(ctx context.Context) error {
-			return grpcserver.Serve(ctx, cfg.GRPC, logger, func(registrar grpc.ServiceRegistrar) {
+			return grpcserver.Serve(ctx, cfg.GRPC, logger, telemetry, func(registrar grpc.ServiceRegistrar) {
 				identityv1.RegisterIdentityServiceServer(registrar, identityServer)
 			}, func() { grpcListening.Store(true) }, func() { grpcListening.Store(false) })
+		},
+		func(ctx context.Context) error {
+			return metricsserver.Serve(ctx, cfg.Telemetry.Metrics, logger, telemetryRuntime.MetricsHandler(), nil)
 		},
 	)
 }

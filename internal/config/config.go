@@ -29,6 +29,7 @@ type Config struct {
 	Payment      CommerceConfig
 	ProductCache ProductCacheConfig
 	Jobs         JobClientConfig
+	Telemetry    TelemetryConfig
 }
 
 type HTTPConfig struct {
@@ -285,6 +286,10 @@ func loadWithDefaults(lookup lookupEnv, defaultServiceName, defaultHTTPAddress s
 			return Config{}, err
 		}
 	}
+	telemetryConfig, err := loadTelemetryConfig(lookup, environment, defaultServiceName)
+	if err != nil {
+		return Config{}, err
+	}
 	requestBudget := readTimeout + databaseConfig.OperationTimeout + 500*time.Millisecond
 	if !isIdentityService {
 		requestBudget += grpcCallTimeout + databaseConfig.CommitResolutionTimeout
@@ -349,7 +354,7 @@ func loadWithDefaults(lookup lookupEnv, defaultServiceName, defaultHTTPAddress s
 		Database: databaseConfig,
 		Log:      LogConfig{Level: logLevel},
 		Auth:     authConfig, Commerce: commerceConfig, Payment: paymentConfig,
-		ProductCache: productCacheConfig, Jobs: jobClientConfig,
+		ProductCache: productCacheConfig, Jobs: jobClientConfig, Telemetry: telemetryConfig,
 	}, nil
 }
 

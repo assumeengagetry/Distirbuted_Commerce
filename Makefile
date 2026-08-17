@@ -88,6 +88,7 @@ run-user: require-env require-user-secrets
 	@set -a; source ./.env; set +a; \
 	export PGPASSFILE='$(SECRETS_DIR)/pgpass'; \
 	export PASETO_V4_LOCAL_KEY="$$(<'$(SECRETS_DIR)/paseto_v4_local_key')"; \
+	export METRICS_ADDR="$${USER_METRICS_ADDR:-127.0.0.1:9101}"; \
 	export QUEUE_REDIS_ADDR="$${QUEUE_REDIS_ADDR-127.0.0.1:6379}"; \
 	if [[ -n "$$QUEUE_REDIS_ADDR" ]]; then test -s '$(SECRETS_DIR)/redis_password' || { printf 'Run make init first.\n' >&2; exit 1; }; export QUEUE_REDIS_PASSWORD="$$(<'$(SECRETS_DIR)/redis_password')"; else unset QUEUE_REDIS_PASSWORD; fi; \
 	export GRPC_ADDR="$${GRPC_ADDR:-127.0.0.1:9091}"; \
@@ -99,6 +100,7 @@ run-order: require-env require-database-secret
 	export HTTP_ADDR="$${ORDER_HTTP_ADDR:-127.0.0.1:8082}"; \
 	export PGPASSFILE='$(SECRETS_DIR)/pgpass'; \
 	export IDENTITY_GRPC_TARGET="$${IDENTITY_GRPC_TARGET:-127.0.0.1:9091}"; \
+	export METRICS_ADDR="$${ORDER_METRICS_ADDR:-127.0.0.1:9102}"; \
 	export CACHE_REDIS_ADDR="$${CACHE_REDIS_ADDR-127.0.0.1:6379}"; \
 	if [[ -n "$$CACHE_REDIS_ADDR" ]]; then test -s '$(SECRETS_DIR)/redis_password' || { printf 'Run make init first.\n' >&2; exit 1; }; export CACHE_REDIS_PASSWORD="$$(<'$(SECRETS_DIR)/redis_password')"; else unset CACHE_REDIS_PASSWORD; fi; \
 	unset PASETO_V4_LOCAL_KEY; \
@@ -110,6 +112,7 @@ run-payment: require-env require-database-secret
 	export HTTP_ADDR="$${PAYMENT_HTTP_ADDR:-127.0.0.1:8083}"; \
 	export PGPASSFILE='$(SECRETS_DIR)/pgpass'; \
 	export IDENTITY_GRPC_TARGET="$${IDENTITY_GRPC_TARGET:-127.0.0.1:9091}"; \
+	export METRICS_ADDR="$${PAYMENT_METRICS_ADDR:-127.0.0.1:9103}"; \
 	unset PASETO_V4_LOCAL_KEY; \
 	exec $(GO) run ./cmd/payment-service
 
@@ -117,6 +120,7 @@ run-worker: require-env require-database-secret require-redis-secret
 	@set -a; source ./.env; set +a; \
 	export SERVICE_NAME='job-worker'; \
 	export PGPASSFILE='$(SECRETS_DIR)/pgpass'; \
+	export METRICS_ADDR="$${WORKER_METRICS_ADDR:-127.0.0.1:9104}"; \
 	export QUEUE_REDIS_ADDR="$${QUEUE_REDIS_ADDR:-127.0.0.1:6379}"; \
 	export QUEUE_REDIS_PASSWORD="$$(<'$(SECRETS_DIR)/redis_password')"; \
 	unset PASETO_V4_LOCAL_KEY; \

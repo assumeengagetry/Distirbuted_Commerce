@@ -1,8 +1,8 @@
 # Distributed Commerce Platform
 
-A production-oriented Go microservice portfolio project built incrementally around transactional commerce workflows. The repository currently implements **Phase 6**: the service foundation, user authentication, catalog/inventory, idempotent orders/payments, deadline-bound protobuf/gRPC identity communication, a fail-open Redis product cache, and retrying Asynq maintenance jobs.
+A production-oriented Go microservice portfolio project built incrementally around transactional commerce workflows. The repository currently implements **Phase 7**: the service foundation, transactional commerce workflows, centralized gRPC identity, Redis caching, retrying Asynq jobs, Prometheus metrics, and OpenTelemetry traces.
 
-External payment providers, refunds, cancellation/restock workflows, transactional outbox delivery, metrics, and tracing are intentionally not claimed as implemented yet.
+External payment providers, refunds, cancellation/restock workflows, transactional outbox delivery, hosted observability backends, dashboards, and alerting are intentionally not claimed as implemented yet.
 
 ## Current Status
 
@@ -41,6 +41,9 @@ Implemented:
 - Cache-aside public product detail reads with PostgreSQL fallback, TTL, generation-fenced fill, and post-write invalidation
 - A separate Asynq worker for bounded expired-session cleanup with uniqueness, retries, archive handling, and single-task recovery tooling
 - Process-owned Redis configuration, loopback-only plaintext, and verified TLS support in production
+- Per-process Prometheus registries with isolated loopback-only `/metrics` listeners
+- Explicit OpenTelemetry instrumentation for Gin, gRPC, pgx, Redis, and Asynq with optional OTLP/gRPC export
+- Trace-context propagation across HTTP, identity RPC, database/cache calls, and delayed jobs plus log correlation
 - PostgreSQL-backed readiness, process liveness, and signal-aware graceful shutdown
 - Rootless PostgreSQL and Redis infrastructure using Podman Quadlet and systemd user units
 - Unit, HTTP, race, and real PostgreSQL/Redis integration tests
@@ -73,6 +76,12 @@ flowchart LR
     QueueRedis --> Worker[Job Worker]
     Worker --> UserRepository
     ProductCache --> CacheRedis[(Redis DB 0 / Cache)]
+    UserHTTP --> Telemetry[Explicit OTel providers]
+    OrderHTTP --> Telemetry
+    PaymentHTTP --> Telemetry
+    Worker --> Telemetry
+    Telemetry --> Metrics[Loopback metrics :9101-:9104]
+    Telemetry -. optional OTLP .-> Collector[External OTel Collector]
     UserRepository --> SQLC[sqlc Queries]
     OrderRepository --> SQLC
     PaymentRepository --> SQLC
@@ -109,8 +118,8 @@ Gin and gRPC remain transport adapters around typed boundaries. The three API pr
 ├── internal/genproto/         # Committed generated protobuf/gRPC Go code
 ├── internal/config/           # Environment parsing and validation
 ├── internal/database/         # pgx pool, PostgreSQL repository, generated sqlc
-├── internal/observability/    # slog construction
-├── internal/platform/         # HTTP/gRPC lifecycle and graceful process orchestration
+├── internal/observability/    # slog correlation, Prometheus registry, OTel providers
+├── internal/platform/         # HTTP/gRPC/metrics lifecycle and process orchestration
 ├── internal/transport/grpc/   # Handwritten identity gRPC adapter
 ├── internal/transport/http/   # Gin handlers and middleware
 ├── api/proto/identity/v1/     # Versioned identity service contract
@@ -141,6 +150,7 @@ Gin and gRPC remain transport adapters around typed boundaries. The three API pr
 | Local containers | Rootless Podman Quadlet |
 | Cache and queue | Redis 7.4, go-redis 9.22, Asynq 0.26 |
 | Logging | Standard library `log/slog` |
+| Metrics and traces | Prometheus client 1.24, OpenTelemetry 1.45/contrib 0.70, OTLP/gRPC |
 | Service manager | systemd user services |
 
 ## HTTP API
@@ -235,7 +245,7 @@ Only the public `GET /v1/products/:product_id` path uses Redis. A validated cach
 
 Each cached or mutated product has a value key with a 30-second default TTL and a persistent generation key. A miss allocates a candidate generation in memory, but initializes the Redis generation only after PostgreSQL returns a valid product, so repeated `404` reads leave no persistent keys. Cache fills use a Lua compare-and-set against the generation observed before the database read. Successful product writes, inventory mutations, and successful or outcome-unknown orders atomically replace generation tokens and delete affected values after repository work, preventing an older concurrent miss from repopulating invalidated data. Redis is deliberately absent from HTTP readiness because PostgreSQL remains authoritative.
 
-Successful register, login, and refresh operations try to enqueue one delayed, versioned `auth:prune-expired-sessions:v1` task after commit when queue settings are enabled. The delay keeps the uniqueness lock for the one-minute coalescing window. When the queue is disabled or enqueue fails, user-service falls back to one bounded PostgreSQL cleanup batch without changing the committed authentication result. The worker also schedules the same idempotent task every minute, uses PostgreSQL time for expiry, drains full batches within a ten-second execution cap, and retries ordinary database errors up to five times with exponential backoff. Invalid payloads skip retries and are archived immediately. The worker never receives the PASETO key or exposes an HTTP port.
+Successful register, login, and refresh operations try to enqueue one delayed, versioned `auth:prune-expired-sessions:v1` task after commit when queue settings are enabled. The delay keeps the uniqueness lock for the one-minute coalescing window. When the queue is disabled or enqueue fails, user-service falls back to one bounded PostgreSQL cleanup batch without changing the committed authentication result. The worker also schedules the same idempotent task every minute, uses PostgreSQL time for expiry, drains full batches within a ten-second execution cap, and retries ordinary database errors up to five times with exponential backoff. Invalid payloads skip retries and are archived immediately. The worker never receives the PASETO key or exposes a business HTTP API; its only HTTP listener is loopback-only metrics.
 
 Inspect and recover archived tasks without exposing payloads:
 
@@ -247,6 +257,16 @@ make jobs-delete ID=<task-id>
 ```
 
 Only single-task retry/delete operations are provided. Asynq delivery is at-least-once, and this maintenance task is idempotent. Future authoritative external side effects require a PostgreSQL transactional outbox rather than best-effort enqueue.
+
+## Metrics And Tracing
+
+Each long-running process owns an isolated Prometheus registry and a dedicated loopback management listener. User, order, payment, and worker expose `GET /metrics` on `127.0.0.1:9101`, `:9102`, `:9103`, and `:9104`. These listeners are separate from business Gin routes, accept no forwarding configuration, expose no health or admin operations, and participate in process-wide startup failure and graceful shutdown.
+
+Metrics include Go/process health, HTTP and gRPC request rates/durations/statuses, PostgreSQL client and pool behavior, Redis pool behavior, public product-cache outcomes, and Asynq request-triggered enqueue/run/duration/deleted-session totals. Queue Redis command tracing is intentionally disabled because polling and heartbeat traffic would create low-value root spans; cache Redis commands remain traced without command text, caller, key, or payload attributes.
+
+Trace export is disabled by default. Setting `OTEL_TRACES_EXPORTER=otlp` and an HTTP(S) `OTEL_EXPORTER_OTLP_ENDPOINT` enables a bounded batch exporter to an external OpenTelemetry Collector. Production requires HTTPS; local plaintext collectors must be loopback. Public Gin listeners intentionally start local roots instead of trusting client-supplied trace IDs or sampling flags. W3C Trace Context then propagates across internal gRPC and Asynq boundaries; baggage is never forwarded. Request-triggered Asynq producers inject trace headers without changing the deterministic task payload or uniqueness key; periodic tasks start root consumer traces, and retries create sibling processing spans. `slog` records created with an active span automatically include `trace_id` and `span_id`, including local unsampled IDs when export is disabled.
+
+Instrumentation receives explicit providers from each composition root; no process-global OTel provider is mutated. Metric labels are limited to protocol routes/methods/statuses, fixed task/cache outcomes, and static service resource attributes. UUIDs, IPs, emails, SKUs, idempotency keys, Redis keys, task payloads, SQL text/parameters, bearer values, and DSNs are not custom metric labels. The repository provides exporters and instrumentation, not a bundled Prometheus server, Collector storage, dashboards, or alert rules.
 
 ## Database Schema
 
@@ -525,6 +545,17 @@ make run-worker
 
 `make infra-up` installs the Quadlets, waits for PostgreSQL/Redis, and creates the isolated database named by `TEST_DATABASE_URL` when absent. Rootless `pasta` publishes infrastructure only on loopback. Local Redis uses AOF, a 192 MiB `noeviction` limit, DB 0 for cache data, DB 1 for Asynq, and DB 15 for destructive tests. User, order, and payment HTTP default to `127.0.0.1:8081`, `:8082`, and `:8083`; user-service also binds identity gRPC on `127.0.0.1:9091`. Start user-service first, then consumers and the worker. Local plaintext HTTP/gRPC/Redis is accepted only on loopback.
 
+Inspect the four local metric endpoints:
+
+```bash
+curl --fail http://127.0.0.1:9101/metrics
+curl --fail http://127.0.0.1:9102/metrics
+curl --fail http://127.0.0.1:9103/metrics
+curl --fail http://127.0.0.1:9104/metrics
+```
+
+To export traces, set `OTEL_TRACES_EXPORTER=otlp` and `OTEL_EXPORTER_OTLP_ENDPOINT` in `.env` before starting the processes. An unreachable Collector does not make request handling depend on telemetry; export is asynchronous and final flushing is bounded.
+
 The tool targets build pinned `golang-migrate`, sqlc, Buf, protobuf generators, and govulncheck into the ignored `bin/` directory. The Go toolchain honors the configured `GOPROXY`.
 
 Stop local infrastructure:
@@ -555,6 +586,18 @@ make infra-down
 | `GRPC_TLS_CA_FILE` | production | none | Internal CA used to verify the peer |
 | `GRPC_TLS_SERVER_NAME` | order/payment production | none | Identity server DNS SAN to verify |
 | `GRPC_TLS_ALLOWED_CLIENT_URIS` | user production | none | Comma-separated allowed order/payment SPIFFE URI SANs |
+| `METRICS_ADDR` | no | process `127.0.0.1:9101-9104` | Loopback-only per-process Prometheus listener |
+| `USER_METRICS_ADDR`, `ORDER_METRICS_ADDR`, `PAYMENT_METRICS_ADDR`, `WORKER_METRICS_ADDR` | make targets only | ports `9101-9104` | Map the shared `.env` to each process's `METRICS_ADDR` |
+| `METRICS_*_TIMEOUT` | no | gather `3s`, write `5s`, shutdown `10s` | Read-header, gather, write, idle, and graceful-shutdown bounds with validated ordering |
+| `OTEL_TRACES_EXPORTER` | no | `none` | `none` or `otlp`; metrics remain enabled in both modes |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | with OTLP traces | none | Root OTLP/gRPC Collector URL without a path; HTTPS required in production, plaintext is loopback-only |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | optional override | none | Trace-specific Collector URL taking precedence over the general endpoint |
+| `OTEL_EXPORTER_OTLP_CERTIFICATE` | optional HTTPS | system roots | PEM CA bundle; trace-specific variant takes precedence |
+| `OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE`, `OTEL_EXPORTER_OTLP_CLIENT_KEY` | optional pair | none | OTLP mTLS client certificate and key |
+| `OTEL_EXPORTER_OTLP_HEADERS` | optional | none | Comma-separated URL-encoded gRPC metadata; trace-specific variant takes precedence |
+| `OTEL_TRACE_SAMPLE_RATIO` | with OTLP traces | `0.1` | Locally enforced parent-based trace ID sampling ratio from `0` to `1` |
+| `TELEMETRY_EXPORT_TIMEOUT` | with OTLP traces | `5s` | Per-batch OTLP export bound; ignored when trace export is disabled |
+| `TELEMETRY_SHUTDOWN_TIMEOUT` | no | `12s` | Two bounded trace exports plus provider/connection shutdown margin |
 | `CACHE_REDIS_ADDR` | order cache | disabled | Product-cache Redis host and port; plaintext is loopback-only |
 | `CACHE_REDIS_USERNAME` | with cache | `commerce` | Product-cache Redis ACL user |
 | `CACHE_REDIS_PASSWORD` | with cache | none | Product-cache Redis password; locally injected from `.secrets/` |
@@ -617,6 +660,14 @@ Each process parses only settings it owns: auth and enqueue settings for user, c
 4. Inspect `make jobs-failed` during rollout. Retry or delete only after classifying the underlying error; neither operation accepts a bulk wildcard.
 5. Roll back order-service by setting `CACHE_REDIS_ADDR` empty, and user-service by setting `QUEUE_REDIS_ADDR` empty. The local Make targets honor an explicitly empty address, and user-service then uses bounded inline session cleanup. Stop the worker only after older queued maintenance tasks are drained or intentionally archived.
 
+### Phase 7 Rollout
+
+1. Configure the host-local Prometheus agent to scrape each process's loopback `/metrics` listener. A metrics bind failure is a process startup failure, so verify all four management ports before sending traffic.
+2. Deploy an OpenTelemetry Collector with memory limits, batching, authenticated export, and attribute filtering. Configure an HTTPS `OTEL_EXPORTER_OTLP_ENDPOINT` plus an explicit CA, optional mTLS pair, and encoded auth headers where required.
+3. Start with `OTEL_TRACE_SAMPLE_RATIO=0.1`, verify one HTTP -> identity gRPC -> PostgreSQL trace and one auth -> Asynq -> worker trace, then tune sampling at the Collector and application only from measured volume.
+4. Build alerts from bounded route, status, dependency, cache-result, and task-result dimensions. Never promote IDs, addresses, raw paths, SQL, Redis keys, payloads, or error text into metric labels.
+5. Roll back trace export with `OTEL_TRACES_EXPORTER=none`; Prometheus metrics and trace-correlated logging remain available without an OTLP backend.
+
 ## Testing
 
 ```bash
@@ -655,6 +706,7 @@ Coverage includes:
 - gRPC-backed order/payment HTTP integration plus listener outage/recovery smoke
 - Product cache miss/fill/hit, TTL, malformed-entry repair, Redis outage fallback, write invalidation, and stale-fill generation races
 - Deterministic Asynq payloads, uniqueness, detached enqueue, strict permanent-error classification, transient retries, archive/retry/delete, and real Redis worker processing
+- Isolated Prometheus registries, loopback metrics-server lifecycle, real in-process OTLP/gRPC export, OTel TLS/config validation, HTTP spans/metrics, Asynq propagation/panic handling, bounded SQL naming, cardinality filters, and log correlation
 - Pinned protobuf/sqlc generation, module tidiness, race/vet/build checks, and reachable-vulnerability scanning
 - Empty-database migration up/down/up validation and serialized cross-package PostgreSQL integration tests
 
@@ -681,6 +733,10 @@ CI and benchmark reporting are Phase 8 work. No performance data is invented.
 - **Generation-fenced cache fills:** post-write generation replacement prevents a slow pre-write miss from restoring stale product data.
 - **At-least-once maintenance jobs:** expired-session deletion is idempotent; invalid payloads archive immediately and transient database errors retry.
 - **No pretend event durability:** best-effort session-cleanup enqueue is acceptable maintenance. Authoritative external side effects require a transactional outbox.
+- **Explicit telemetry ownership:** each process injects its own providers and registry; application code never mutates global OTel state or the default Prometheus registry.
+- **Host-local metrics plane:** management listeners stay loopback-only in every environment; production scrapers use a host-local agent or trusted proxy.
+- **Trace-only optional dependency:** OTLP export is asynchronous and can be disabled independently; business readiness never depends on the Collector.
+- **Bounded observability cardinality:** metrics use route templates and fixed outcomes, while logs and sampled traces carry request-specific diagnostic context.
 
 ## Security Baseline
 
@@ -696,6 +752,10 @@ CI and benchmark reporting are Phase 8 work. No performance data is invented.
 - Bearer values are never logged by gRPC adapters; dependency diagnostics contain target/code/cause only.
 - Production identity RPC uses TLS 1.3 mTLS plus an exact SPIFFE URI client allowlist.
 - Redis plaintext is loopback-only; production cache/queue clients require a trusted CA and server name with TLS 1.3 minimum.
+- Prometheus listeners are always loopback-only; production OTLP export requires HTTPS and bounded startup/export/shutdown timeouts.
+- Trace propagation accepts W3C Trace Context only and does not forward arbitrary baggage.
+- Public HTTP ignores client-supplied trace parents and sampling decisions; trust begins at the local Gin server span.
+- Custom telemetry excludes credentials, tokens, payloads, SQL text/parameters, Redis commands/keys, UUIDs, IPs, emails, and idempotency keys from metric labels.
 - Cache and task payload schemas are versioned and strictly validated; task errors never log payloads or Redis passwords.
 - gRPC limits request/response/metadata sizes, concurrent streams, server execution time, and graceful drain time.
 - `release-check` runs govulncheck and fails on vulnerabilities reachable through application call paths.
@@ -711,7 +771,7 @@ CI and benchmark reporting are Phase 8 work. No performance data is invented.
 4. **Phase 4 complete:** account debit, payment transactions, paid-order transition, and order/payment idempotency.
 5. **Phase 5 complete:** versioned identity protobuf, deadline-bound gRPC auth, mTLS, health, and coordinated lifecycle.
 6. **Phase 6 complete:** fail-open Redis product cache, generation-fenced invalidation, Asynq maintenance jobs, retries, archive handling, and recovery tooling.
-7. **Phase 7:** Prometheus metrics and OpenTelemetry traces.
+7. **Phase 7 complete:** isolated Prometheus endpoints, explicit OTel providers, OTLP traces, cross-HTTP/gRPC/database/cache/job propagation, and correlated logs.
 8. **Phase 8:** production images, Kubernetes, OpenAPI, CI, benchmarks, and final portfolio documentation.
 
 ## Known Limitations
@@ -730,4 +790,4 @@ CI and benchmark reporting are Phase 8 work. No performance data is invented.
 - Email verification, password reset, MFA, account deletion, and audit history are not implemented.
 - The local PostgreSQL bootstrap role owns the development database; separate production migrator/runtime roles arrive with production deployment work.
 - A fresh database has no administrator bootstrap or customer funding command, so the documented HTTP examples alone cannot complete an admin-create-to-payment walkthrough.
-- Metrics and tracing are not represented as completed features.
+- Prometheus storage, the OpenTelemetry Collector, dashboards, SLOs, and alert routing are external deployment concerns and are not bundled in this repository.

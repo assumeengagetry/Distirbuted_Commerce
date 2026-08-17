@@ -9,6 +9,7 @@ import (
 	"time"
 
 	store "github.com/assumeengagetry/distributed-commerce/internal/database/sqlc"
+	"github.com/assumeengagetry/distributed-commerce/internal/observability"
 )
 
 func TestPostgresConnectionAndMigration(t *testing.T) {
@@ -20,7 +21,7 @@ func TestPostgresConnectionAndMigration(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	pool, err := Open(ctx, databaseConfig(databaseURL))
+	pool, err := Open(ctx, databaseConfig(databaseURL), observability.NoopProviders())
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -10,11 +11,14 @@ import (
 	"time"
 
 	"github.com/hibiken/asynq"
+	"github.com/redis/go-redis/v9"
 
 	"github.com/assumeengagetry/distributed-commerce/internal/config"
 	"github.com/assumeengagetry/distributed-commerce/internal/database"
 	"github.com/assumeengagetry/distributed-commerce/internal/jobs"
 	"github.com/assumeengagetry/distributed-commerce/internal/observability"
+	"github.com/assumeengagetry/distributed-commerce/internal/platform/metricsserver"
+	"github.com/assumeengagetry/distributed-commerce/internal/platform/process"
 	"github.com/assumeengagetry/distributed-commerce/internal/redisclient"
 )
 
@@ -26,7 +30,7 @@ func main() {
 	}
 }
 
-func run() error {
+func run() (result error) {
 	cfg, err := config.LoadJobWorker()
 	if err != nil {
 		return err
@@ -37,8 +41,18 @@ func run() error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	telemetryRuntime, err := observability.NewRuntime(ctx, cfg.Telemetry, cfg.ServiceName, cfg.Environment)
+	if err != nil {
+		return fmt.Errorf("create telemetry runtime: %w", err)
+	}
+	defer func() {
+		if err := telemetryRuntime.ShutdownWithin(cfg.Telemetry.ShutdownTimeout); err != nil {
+			result = errors.Join(result, fmt.Errorf("shutdown telemetry: %w", err))
+		}
+	}()
+	telemetry := telemetryRuntime.Providers()
 
-	pool, err := database.Open(ctx, cfg.Database)
+	pool, err := database.Open(ctx, cfg.Database, telemetry)
 	if err != nil {
 		return fmt.Errorf("open database: %w", err)
 	}
@@ -48,6 +62,9 @@ func run() error {
 		return fmt.Errorf("create queue Redis client: %w", err)
 	}
 	defer queueRedis.Close()
+	if err := redisclient.Instrument(queueRedis, telemetry, "queue", false); err != nil {
+		return fmt.Errorf("instrument queue Redis client: %w", err)
+	}
 	pingCtx, pingCancel := context.WithTimeout(ctx, cfg.Redis.DialTimeout)
 	err = queueRedis.Ping(pingCtx).Err()
 	pingCancel()
@@ -63,10 +80,30 @@ func run() error {
 			TaskTimeout:     cfg.TaskTimeout,
 			BatchSize:       cfg.SessionCleanupBatchSize,
 		},
+		telemetry,
 	)
 	if err != nil {
 		return fmt.Errorf("create job handler: %w", err)
 	}
+	return process.Run(
+		ctx,
+		func(ctx context.Context) error {
+			return serveJobs(ctx, cfg, logger, queueRedis, handler, stop)
+		},
+		func(ctx context.Context) error {
+			return metricsserver.Serve(ctx, cfg.Telemetry.Metrics, logger, telemetryRuntime.MetricsHandler(), nil)
+		},
+	)
+}
+
+func serveJobs(
+	ctx context.Context,
+	cfg config.JobWorkerConfig,
+	logger *slog.Logger,
+	queueRedis *redis.Client,
+	handler *jobs.Handler,
+	shutdownStarted func(),
+) error {
 	mux := asynq.NewServeMux()
 	handler.Register(mux)
 	asynqLogger := jobs.NewLogger(logger)
@@ -110,7 +147,9 @@ func run() error {
 		slog.Duration("cleanup_interval", cfg.CleanupInterval),
 	)
 	<-ctx.Done()
-	stop()
+	if shutdownStarted != nil {
+		shutdownStarted()
+	}
 	logger.Info("job worker shutdown signal received")
 	scheduler.Shutdown()
 	server.Shutdown()

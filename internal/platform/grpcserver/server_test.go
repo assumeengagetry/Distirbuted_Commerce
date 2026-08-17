@@ -17,6 +17,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/assumeengagetry/distributed-commerce/internal/config"
+	"github.com/assumeengagetry/distributed-commerce/internal/observability"
 )
 
 func TestDeadlineInterceptorBoundsRequest(t *testing.T) {
@@ -59,7 +60,7 @@ func TestServeHealthAndGracefulShutdown(t *testing.T) {
 	go func() {
 		serverErrors <- Serve(ctx, config.GRPCConfig{
 			Address: address, RequestTimeout: time.Second, ShutdownTimeout: time.Second,
-		}, slog.New(slog.NewJSONHandler(io.Discard, nil)), func(grpc.ServiceRegistrar) {}, nil, func() { close(unavailable) })
+		}, slog.New(slog.NewJSONHandler(io.Discard, nil)), observability.NoopProviders(), func(grpc.ServiceRegistrar) {}, nil, func() { close(unavailable) })
 	}()
 	connection, err := grpc.NewClient(address, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
@@ -115,7 +116,7 @@ func TestServeBoundsIncompleteConnectionHandshake(t *testing.T) {
 	go func() {
 		serverErrors <- Serve(ctx, config.GRPCConfig{
 			Address: address, RequestTimeout: time.Second, ShutdownTimeout: 50 * time.Millisecond,
-		}, slog.New(slog.NewJSONHandler(io.Discard, nil)), func(grpc.ServiceRegistrar) {}, func() { close(listening) }, nil)
+		}, slog.New(slog.NewJSONHandler(io.Discard, nil)), observability.NoopProviders(), func(grpc.ServiceRegistrar) {}, func() { close(listening) }, nil)
 	}()
 	select {
 	case <-listening:

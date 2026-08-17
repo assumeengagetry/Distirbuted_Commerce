@@ -20,6 +20,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/assumeengagetry/distributed-commerce/internal/idempotency"
+	"github.com/assumeengagetry/distributed-commerce/internal/observability"
 	commerce "github.com/assumeengagetry/distributed-commerce/internal/order"
 )
 
@@ -501,7 +502,7 @@ func openOrderRepositoryIntegration(t *testing.T) (context.Context, *pgxpool.Poo
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	t.Cleanup(cancel)
-	pool, err := Open(ctx, databaseConfig(databaseURL))
+	pool, err := Open(ctx, databaseConfig(databaseURL), observability.NoopProviders())
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}

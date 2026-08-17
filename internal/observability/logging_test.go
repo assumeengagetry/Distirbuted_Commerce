@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"testing"
 
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/assumeengagetry/distributed-commerce/internal/config"
 )
 
@@ -38,6 +40,35 @@ func TestNewLoggerWritesStructuredContext(t *testing.T) {
 	}
 	if _, ok := entry["time"]; !ok {
 		t.Error("log entry does not contain time")
+	}
+}
+
+func TestLoggerAddsTraceCorrelationFromContext(t *testing.T) {
+	t.Parallel()
+	var output bytes.Buffer
+	logger, err := NewLogger(&output, config.LogConfig{Level: "info"}, "order-service", "test")
+	if err != nil {
+		t.Fatalf("NewLogger() error = %v", err)
+	}
+	traceID, err := trace.TraceIDFromHex("0102030405060708090a0b0c0d0e0f10")
+	if err != nil {
+		t.Fatalf("TraceIDFromHex() error = %v", err)
+	}
+	spanID, err := trace.SpanIDFromHex("0102030405060708")
+	if err != nil {
+		t.Fatalf("SpanIDFromHex() error = %v", err)
+	}
+	ctx := trace.ContextWithSpanContext(context.Background(), trace.NewSpanContext(trace.SpanContextConfig{
+		TraceID: traceID, SpanID: spanID, TraceFlags: trace.FlagsSampled,
+	}))
+	logger.InfoContext(ctx, "correlated")
+
+	var entry map[string]any
+	if err := json.Unmarshal(output.Bytes(), &entry); err != nil {
+		t.Fatalf("unmarshal log entry: %v", err)
+	}
+	if entry["trace_id"] != traceID.String() || entry["span_id"] != spanID.String() {
+		t.Fatalf("trace correlation = trace:%v span:%v", entry["trace_id"], entry["span_id"])
 	}
 }
 

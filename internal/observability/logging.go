@@ -1,10 +1,13 @@
 package observability
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log/slog"
 	"strings"
+
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/assumeengagetry/distributed-commerce/internal/config"
 )
@@ -15,11 +18,38 @@ func NewLogger(output io.Writer, cfg config.LogConfig, serviceName, environment 
 		return nil, err
 	}
 
-	handler := slog.NewJSONHandler(output, &slog.HandlerOptions{Level: level})
+	handler := traceContextHandler{slog.NewJSONHandler(output, &slog.HandlerOptions{Level: level})}
 	return slog.New(handler).With(
 		slog.String("service", serviceName),
 		slog.String("environment", environment),
 	), nil
+}
+
+type traceContextHandler struct {
+	next slog.Handler
+}
+
+func (h traceContextHandler) Enabled(ctx context.Context, level slog.Level) bool {
+	return h.next.Enabled(ctx, level)
+}
+
+func (h traceContextHandler) Handle(ctx context.Context, record slog.Record) error {
+	spanContext := trace.SpanContextFromContext(ctx)
+	if spanContext.IsValid() {
+		record.AddAttrs(
+			slog.String("trace_id", spanContext.TraceID().String()),
+			slog.String("span_id", spanContext.SpanID().String()),
+		)
+	}
+	return h.next.Handle(ctx, record)
+}
+
+func (h traceContextHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return traceContextHandler{next: h.next.WithAttrs(attrs)}
+}
+
+func (h traceContextHandler) WithGroup(name string) slog.Handler {
+	return traceContextHandler{next: h.next.WithGroup(name)}
 }
 
 func parseLevel(value string) (slog.Level, error) {

@@ -25,6 +25,7 @@ import (
 	"github.com/assumeengagetry/distributed-commerce/internal/auth"
 	"github.com/assumeengagetry/distributed-commerce/internal/config"
 	identityv1 "github.com/assumeengagetry/distributed-commerce/internal/genproto/identity/v1"
+	"github.com/assumeengagetry/distributed-commerce/internal/observability"
 	"github.com/assumeengagetry/distributed-commerce/internal/platform/grpcserver"
 )
 
@@ -48,7 +49,7 @@ func TestMutualTLSAuthenticatesServerAndAllowedClient(t *testing.T) {
 			Address: address, RequestTimeout: time.Second, ShutdownTimeout: time.Second,
 			TLSCertFile: pki.serverCert, TLSKeyFile: pki.serverKey, TLSCAFile: pki.caCert,
 			TLSAllowedClientURIs: []string{pki.allowedURI},
-		}, slog.New(slog.NewJSONHandler(io.Discard, nil)), func(registrar grpc.ServiceRegistrar) {
+		}, slog.New(slog.NewJSONHandler(io.Discard, nil)), observability.NoopProviders(), func(registrar grpc.ServiceRegistrar) {
 			identityv1.RegisterIdentityServiceServer(registrar, &stubIdentityRPC{response: &identityv1.ValidateAccessTokenResponse{
 				UserId: userID.String(), Role: identityv1.PrincipalRole_PRINCIPAL_ROLE_CUSTOMER,
 				TokenId: tokenID.String(),

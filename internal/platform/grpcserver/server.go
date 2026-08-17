@@ -12,6 +12,7 @@ import (
 	"runtime/debug"
 	"time"
 
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
@@ -20,6 +21,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/assumeengagetry/distributed-commerce/internal/config"
+	"github.com/assumeengagetry/distributed-commerce/internal/observability"
 )
 
 const (
@@ -34,6 +36,7 @@ func Serve(
 	ctx context.Context,
 	cfg config.GRPCConfig,
 	logger *slog.Logger,
+	telemetry observability.Providers,
 	register RegisterServices,
 	onListening func(),
 	onUnavailable func(),
@@ -52,6 +55,14 @@ func Serve(
 		grpc.MaxHeaderListSize(maximumMetadataBytes),
 		grpc.MaxConcurrentStreams(1000),
 		grpc.ChainUnaryInterceptor(recoveryInterceptor(logger), deadlineInterceptor(cfg.RequestTimeout)),
+	}
+	if telemetry.Enabled() {
+		serverOptions = append(serverOptions, grpc.StatsHandler(otelgrpc.NewServerHandler(
+			otelgrpc.WithTracerProvider(telemetry.TracerProvider),
+			otelgrpc.WithMeterProvider(telemetry.MeterProvider),
+			otelgrpc.WithPropagators(telemetry.Propagator),
+			otelgrpc.WithFilter(observability.IdentityRPCFilter),
+		)))
 	}
 	tlsCredentials, err := serverTransportCredentials(cfg)
 	if err != nil {

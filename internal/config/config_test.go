@@ -48,6 +48,9 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.Log.Level != "info" {
 		t.Errorf("Log.Level = %q, want info", cfg.Log.Level)
 	}
+	if cfg.Telemetry.Metrics.Address != "127.0.0.1:9101" || cfg.Telemetry.TracesExporter != "none" {
+		t.Errorf("Telemetry defaults = %+v", cfg.Telemetry)
+	}
 	if cfg.Auth.AccessTokenTTL != 15*time.Minute || cfg.Auth.RefreshTokenTTL != 7*24*time.Hour {
 		t.Errorf("token TTLs = (%s, %s), want (15m, 168h)", cfg.Auth.AccessTokenTTL, cfg.Auth.RefreshTokenTTL)
 	}
@@ -110,6 +113,9 @@ func TestLoadUsesProcessSpecificDefaults(t *testing.T) {
 	}
 	if cfg.ServiceName != "order-service" || cfg.HTTP.Address != "127.0.0.1:8082" {
 		t.Fatalf("process defaults = (%q, %q)", cfg.ServiceName, cfg.HTTP.Address)
+	}
+	if cfg.Telemetry.Metrics.Address != "127.0.0.1:9102" {
+		t.Fatalf("order-service metrics address = %q", cfg.Telemetry.Metrics.Address)
 	}
 	if cfg.GRPC.Address != "" || cfg.GRPC.IdentityTarget != "127.0.0.1:9091" ||
 		cfg.GRPC.CallTimeout != time.Second || cfg.GRPC.RequestTimeout != 0 || cfg.GRPC.ShutdownTimeout != 0 {

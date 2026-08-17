@@ -9,6 +9,9 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin"
+
+	"github.com/assumeengagetry/distributed-commerce/internal/observability"
 )
 
 type Dependencies struct {
@@ -20,6 +23,7 @@ type Dependencies struct {
 	TokenVerifier    AccessTokenVerifier
 	AuthRateLimit    RateLimitConfig
 	Now              func() time.Time
+	Telemetry        observability.Providers
 }
 
 func NewRouter(deps Dependencies) (*gin.Engine, error) {
@@ -34,7 +38,7 @@ func NewRouter(deps Dependencies) (*gin.Engine, error) {
 	}
 	router, err := newBaseRouter(baseDependencies{
 		Logger: deps.Logger, ServiceName: deps.ServiceName, ReadinessChecks: deps.ReadinessChecks,
-		ReadinessTimeout: deps.ReadinessTimeout,
+		ReadinessTimeout: deps.ReadinessTimeout, Telemetry: deps.Telemetry,
 	})
 	if err != nil {
 		return nil, err
@@ -62,6 +66,7 @@ type baseDependencies struct {
 	ServiceName      string
 	ReadinessChecks  map[string]func(context.Context) error
 	ReadinessTimeout time.Duration
+	Telemetry        observability.Providers
 }
 
 func newBaseRouter(deps baseDependencies) (*gin.Engine, error) {
@@ -88,6 +93,14 @@ func newBaseRouter(deps baseDependencies) (*gin.Engine, error) {
 	router.HandleMethodNotAllowed = true
 	if err := router.SetTrustedProxies(nil); err != nil {
 		return nil, fmt.Errorf("disable trusted proxies: %w", err)
+	}
+	if deps.Telemetry.Enabled() {
+		router.Use(otelgin.Middleware(
+			deps.ServiceName,
+			otelgin.WithTracerProvider(deps.Telemetry.TracerProvider),
+			otelgin.WithMeterProvider(deps.Telemetry.MeterProvider),
+			otelgin.WithPropagators(observability.PublicHTTPPropagator()),
+		))
 	}
 	router.Use(requestIDMiddleware(), securityHeaders(), recovery(deps.Logger))
 	router.NoRoute(func(c *gin.Context) {

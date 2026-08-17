@@ -13,7 +13,10 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 
+	"github.com/assumeengagetry/distributed-commerce/internal/observability"
 	"github.com/assumeengagetry/distributed-commerce/internal/order"
 )
 
@@ -77,6 +80,27 @@ type Repository struct {
 	logger           *slog.Logger
 	ttl              time.Duration
 	operationTimeout time.Duration
+	lookups          metric.Int64Counter
+}
+
+func (r *Repository) Instrument(providers observability.Providers) error {
+	if r == nil {
+		return fmt.Errorf("product cache repository is required")
+	}
+	if !providers.Enabled() {
+		return nil
+	}
+	lookups, err := providers.MeterProvider.Meter(
+		"github.com/assumeengagetry/distributed-commerce/internal/productcache",
+	).Int64Counter(
+		"commerce.product_cache.lookups",
+		metric.WithDescription("Public product cache lookup outcomes"),
+	)
+	if err != nil {
+		return fmt.Errorf("create product cache lookup counter: %w", err)
+	}
+	r.lookups = lookups
+	return nil
 }
 
 var _ order.Repository = (*Repository)(nil)
@@ -136,12 +160,23 @@ func (r *Repository) UpdateProduct(
 func (r *Repository) GetProduct(ctx context.Context, productID uuid.UUID) (order.Product, error) {
 	generation, cached, hit, canFill := r.readProduct(ctx, productID)
 	if hit {
+		r.recordLookup(ctx, "hit")
 		return cached, nil
 	}
 
 	product, err := r.next.GetProduct(ctx, productID)
 	if err != nil {
+		if errors.Is(err, order.ErrProductNotFound) {
+			r.recordLookup(ctx, "not_found")
+		} else {
+			r.recordLookup(ctx, "backend_error")
+		}
 		return product, err
+	}
+	if canFill {
+		r.recordLookup(ctx, "miss")
+	} else {
+		r.recordLookup(ctx, "bypass")
 	}
 	if !canFill || !validCachedProduct(product, productID) {
 		return product, nil
@@ -150,6 +185,12 @@ func (r *Repository) GetProduct(ctx context.Context, productID uuid.UUID) (order
 		r.logCacheFailure(ctx, "fill", productID, err)
 	}
 	return product, nil
+}
+
+func (r *Repository) recordLookup(ctx context.Context, result string) {
+	if r.lookups != nil {
+		r.lookups.Add(ctx, 1, metric.WithAttributes(attribute.String("commerce.cache.result", result)))
+	}
 }
 
 func (r *Repository) GetAdminProduct(

@@ -76,6 +76,25 @@ func TestNewPoolConfigDoesNotExposeInvalidURL(t *testing.T) {
 	}
 }
 
+func TestTelemetryQueryNameIsBoundedAndDoesNotExposeSQL(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		statement string
+		want      string
+	}{
+		{statement: "-- name: CreateOrder :one\nINSERT INTO orders VALUES ($1)", want: "CreateOrder"},
+		{statement: " SELECT secret FROM users WHERE email = $1", want: "SELECT"},
+		{statement: "UPDATE accounts SET balance = 0", want: "UPDATE"},
+		{statement: "WITH private_data AS (SELECT 1) SELECT * FROM private_data", want: "SQL"},
+		{statement: "", want: "SQL"},
+	}
+	for _, test := range tests {
+		if got := telemetryQueryName(test.statement); got != test.want {
+			t.Errorf("telemetryQueryName(%q) = %q, want %q", test.statement, got, test.want)
+		}
+	}
+}
+
 func databaseConfig(url string) config.DatabaseConfig {
 	return config.DatabaseConfig{
 		URL:                     url,

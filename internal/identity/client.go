@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
@@ -21,6 +22,7 @@ import (
 
 	"github.com/assumeengagetry/distributed-commerce/internal/auth"
 	identityv1 "github.com/assumeengagetry/distributed-commerce/internal/genproto/identity/v1"
+	"github.com/assumeengagetry/distributed-commerce/internal/observability"
 )
 
 const (
@@ -36,6 +38,7 @@ type ClientConfig struct {
 	TLSCAFile     string
 	TLSServerName string
 	Logger        *slog.Logger
+	Telemetry     observability.Providers
 }
 
 type Client struct {
@@ -55,8 +58,7 @@ func Dial(config ClientConfig) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	connection, err := grpc.NewClient(
-		config.Target,
+	dialOptions := []grpc.DialOption{
 		grpc.WithTransportCredentials(transportCredentials),
 		grpc.WithDisableRetry(),
 		grpc.WithMaxHeaderListSize(maximumClientMetadataBytes),
@@ -64,7 +66,16 @@ func Dial(config ClientConfig) (*Client, error) {
 			grpc.MaxCallSendMsgSize(1<<20),
 			grpc.MaxCallRecvMsgSize(4<<20),
 		),
-	)
+	}
+	if config.Telemetry.Enabled() {
+		dialOptions = append(dialOptions, grpc.WithStatsHandler(otelgrpc.NewClientHandler(
+			otelgrpc.WithTracerProvider(config.Telemetry.TracerProvider),
+			otelgrpc.WithMeterProvider(config.Telemetry.MeterProvider),
+			otelgrpc.WithPropagators(config.Telemetry.Propagator),
+			otelgrpc.WithFilter(observability.IdentityRPCFilter),
+		)))
+	}
+	connection, err := grpc.NewClient(config.Target, dialOptions...)
 	if err != nil {
 		return nil, fmt.Errorf("create identity gRPC client: %w", err)
 	}

@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/assumeengagetry/distributed-commerce/internal/auth"
+	"github.com/assumeengagetry/distributed-commerce/internal/observability"
 	"github.com/assumeengagetry/distributed-commerce/internal/user"
 )
 
@@ -297,7 +298,7 @@ func openUserRepositoryIntegration(t *testing.T) (context.Context, *pgxpool.Pool
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	t.Cleanup(cancel)
-	pool, err := Open(ctx, databaseConfig(databaseURL))
+	pool, err := Open(ctx, databaseConfig(databaseURL), observability.NoopProviders())
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}

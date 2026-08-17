@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/hibiken/asynq"
+
+	"github.com/assumeengagetry/distributed-commerce/internal/observability"
 )
 
 func TestNewHandlerValidation(t *testing.T) {
@@ -35,13 +37,13 @@ func TestNewHandlerValidation(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if handler, err := NewHandler(test.repository, test.logger, test.config); err == nil || handler != nil {
+			if handler, err := NewHandler(test.repository, test.logger, test.config, observability.NoopProviders()); err == nil || handler != nil {
 				t.Fatalf("NewHandler() = (%v, %v), want (nil, error)", handler, err)
 			}
 		})
 	}
 
-	if handler, err := NewHandler(validRepository, validLogger, validConfig); err != nil || handler == nil {
+	if handler, err := NewHandler(validRepository, validLogger, validConfig, observability.NoopProviders()); err != nil || handler == nil {
 		t.Fatalf("NewHandler() = (%v, %v), want a handler", handler, err)
 	}
 }
@@ -126,7 +128,7 @@ func TestHandleSessionCleanupUsesBatchAndLogsCount(t *testing.T) {
 	}}
 	config := testHandlerConfig()
 	config.BatchSize = 250
-	handler, err := NewHandler(repository, slog.New(slog.NewJSONHandler(&output, nil)), config)
+	handler, err := NewHandler(repository, slog.New(slog.NewJSONHandler(&output, nil)), config, observability.NoopProviders())
 	if err != nil {
 		t.Fatalf("NewHandler() error = %v", err)
 	}
@@ -215,7 +217,7 @@ func (repository *stubSessionRepository) DeleteExpiredSessions(ctx context.Conte
 
 func mustTestHandler(t *testing.T, repository SessionRepository, output io.Writer) *Handler {
 	t.Helper()
-	handler, err := NewHandler(repository, slog.New(slog.NewJSONHandler(output, nil)), testHandlerConfig())
+	handler, err := NewHandler(repository, slog.New(slog.NewJSONHandler(output, nil)), testHandlerConfig(), observability.NoopProviders())
 	if err != nil {
 		t.Fatalf("NewHandler() error = %v", err)
 	}

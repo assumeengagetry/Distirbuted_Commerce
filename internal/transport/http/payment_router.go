@@ -9,6 +9,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 
+	"github.com/assumeengagetry/distributed-commerce/internal/observability"
 	"github.com/assumeengagetry/distributed-commerce/internal/payment"
 )
 
@@ -26,6 +27,7 @@ type PaymentDependencies struct {
 	TokenVerifier    AccessTokenVerifier
 	RateLimit        RateLimitConfig
 	Now              func() time.Time
+	Telemetry        observability.Providers
 }
 
 func NewPaymentRouter(deps PaymentDependencies) (*gin.Engine, error) {
@@ -40,7 +42,7 @@ func NewPaymentRouter(deps PaymentDependencies) (*gin.Engine, error) {
 	}
 	router, err := newBaseRouter(baseDependencies{
 		Logger: deps.Logger, ServiceName: deps.ServiceName, ReadinessChecks: deps.ReadinessChecks,
-		ReadinessTimeout: deps.ReadinessTimeout,
+		ReadinessTimeout: deps.ReadinessTimeout, Telemetry: deps.Telemetry,
 	})
 	if err != nil {
 		return nil, err

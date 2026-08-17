@@ -112,7 +112,8 @@ func TestLoadJobWorkerDefaults(t *testing.T) {
 	}
 	if cfg.ServiceName != "job-worker" || cfg.Queue != "maintenance" || cfg.Concurrency != 4 ||
 		cfg.TaskTimeout != 10*time.Second || cfg.ShutdownTimeout != 15*time.Second ||
-		cfg.CleanupInterval != time.Minute || cfg.SessionCleanupBatchSize != 100 || cfg.Redis.Database != 1 {
+		cfg.CleanupInterval != time.Minute || cfg.SessionCleanupBatchSize != 100 || cfg.Redis.Database != 1 ||
+		cfg.Telemetry.Metrics.Address != "127.0.0.1:9104" {
 		t.Fatalf("worker config = %+v", cfg)
 	}
 }

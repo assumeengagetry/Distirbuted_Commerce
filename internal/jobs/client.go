@@ -10,6 +10,9 @@ import (
 
 	"github.com/hibiken/asynq"
 	"github.com/redis/go-redis/v9"
+	"go.opentelemetry.io/otel/codes"
+
+	"github.com/assumeengagetry/distributed-commerce/internal/observability"
 )
 
 const SessionCleanupTaskType = "auth:prune-expired-sessions:v1"
@@ -32,9 +35,14 @@ type Client struct {
 	enqueueTimeout time.Duration
 	taskTimeout    time.Duration
 	uniqueTTL      time.Duration
+	telemetry      jobTelemetry
 }
 
-func NewClient(redisClient redis.UniversalClient, cfg ClientConfig) (*Client, error) {
+func NewClient(
+	redisClient redis.UniversalClient,
+	cfg ClientConfig,
+	providers observability.Providers,
+) (*Client, error) {
 	if nilUniversalClient(redisClient) {
 		return nil, fmt.Errorf("redis client is required")
 	}
@@ -50,6 +58,10 @@ func NewClient(redisClient redis.UniversalClient, cfg ClientConfig) (*Client, er
 	if cfg.UniqueTTL < time.Second {
 		return nil, fmt.Errorf("unique TTL must be at least one second")
 	}
+	telemetry, err := newJobTelemetry(providers)
+	if err != nil {
+		return nil, err
+	}
 
 	return &Client{
 		client:         asynq.NewClientFromRedisClient(redisClient),
@@ -57,6 +69,7 @@ func NewClient(redisClient redis.UniversalClient, cfg ClientConfig) (*Client, er
 		enqueueTimeout: cfg.EnqueueTimeout,
 		taskTimeout:    cfg.TaskTimeout,
 		uniqueTTL:      cfg.UniqueTTL,
+		telemetry:      telemetry,
 	}, nil
 }
 
@@ -78,8 +91,10 @@ func validQueueName(value string) bool {
 func (c *Client) ScheduleSessionCleanup(ctx context.Context) error {
 	enqueueCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.enqueueTimeout)
 	defer cancel()
+	enqueueCtx, span := c.telemetry.startProducer(enqueueCtx)
+	defer span.End()
 
-	task := NewSessionCleanupTask()
+	task := c.telemetry.sessionCleanupTask(enqueueCtx)
 	_, err := c.client.EnqueueContext(
 		enqueueCtx,
 		task,
@@ -87,11 +102,15 @@ func (c *Client) ScheduleSessionCleanup(ctx context.Context) error {
 			asynq.ProcessIn(c.uniqueTTL), asynq.Unique(c.uniqueTTL+c.taskTimeout))...,
 	)
 	if errors.Is(err, asynq.ErrDuplicateTask) {
+		c.telemetry.recordEnqueue(enqueueCtx, "duplicate")
 		return nil
 	}
 	if err != nil {
+		c.telemetry.recordEnqueue(enqueueCtx, "error")
+		span.SetStatus(codes.Error, "enqueue failed")
 		return fmt.Errorf("enqueue session cleanup task: %w", err)
 	}
+	c.telemetry.recordEnqueue(enqueueCtx, "accepted")
 	return nil
 }
 

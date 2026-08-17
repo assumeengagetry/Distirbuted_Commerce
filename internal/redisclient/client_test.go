@@ -16,8 +16,13 @@ import (
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
+	"go.opentelemetry.io/otel/propagation"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+	tracenoop "go.opentelemetry.io/otel/trace/noop"
 
 	"github.com/assumeengagetry/distributed-commerce/internal/config"
+	"github.com/assumeengagetry/distributed-commerce/internal/observability"
 )
 
 func TestNewClientConnectsWithBoundedOptions(t *testing.T) {
@@ -95,6 +100,40 @@ func TestNewClientVerifiesRedisTLS13Server(t *testing.T) {
 	t.Cleanup(func() { _ = wrongClient.Close() })
 	if err := wrongClient.Ping(t.Context()).Err(); err == nil {
 		t.Fatal("Ping() accepted a Redis certificate for the wrong server name")
+	}
+}
+
+func TestInstrumentAddsRedisPoolMetricsAndBoundsNames(t *testing.T) {
+	t.Parallel()
+	server := miniredis.RunT(t)
+	server.RequireUserAuth("commerce", "secret")
+	client, err := New(testConfig(server.Addr()))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	reader := sdkmetric.NewManualReader()
+	meterProvider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() { _ = meterProvider.Shutdown(context.Background()) })
+	providers := observability.Providers{
+		TracerProvider: tracenoop.NewTracerProvider(), MeterProvider: meterProvider,
+		Propagator: propagation.TraceContext{},
+	}
+	if err := Instrument(client, providers, "cache", true); err != nil {
+		t.Fatalf("Instrument() error = %v", err)
+	}
+	if err := client.Ping(t.Context()).Err(); err != nil {
+		t.Fatalf("Ping() error = %v", err)
+	}
+	var metrics metricdata.ResourceMetrics
+	if err := reader.Collect(t.Context(), &metrics); err != nil {
+		t.Fatalf("Collect() error = %v", err)
+	}
+	if len(metrics.ScopeMetrics) == 0 {
+		t.Fatal("Redis instrumentation produced no metrics")
+	}
+	if err := Instrument(client, providers, server.Addr(), false); err == nil {
+		t.Fatal("Instrument() accepted a dynamic pool name")
 	}
 }
 

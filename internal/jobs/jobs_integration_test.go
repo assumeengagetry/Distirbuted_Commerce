@@ -18,6 +18,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/hibiken/asynq"
 	"github.com/redis/go-redis/v9"
+
+	"github.com/assumeengagetry/distributed-commerce/internal/observability"
 )
 
 func TestRealRedisWorkerRetryArchiveAndRecovery(t *testing.T) {
@@ -33,7 +35,7 @@ func TestRealRedisWorkerRetryArchiveAndRecovery(t *testing.T) {
 	}}
 	handler, err := NewHandler(repository, logger, HandlerConfig{
 		DatabaseTimeout: time.Second, TaskTimeout: 2 * time.Second, BatchSize: 100,
-	})
+	}, observability.NoopProviders())
 	if err != nil {
 		t.Fatalf("NewHandler() error = %v", err)
 	}
@@ -52,7 +54,7 @@ func TestRealRedisWorkerRetryArchiveAndRecovery(t *testing.T) {
 
 	client, err := NewClient(redisClient, ClientConfig{
 		Queue: queue, EnqueueTimeout: time.Second, TaskTimeout: time.Second, UniqueTTL: time.Second,
-	})
+	}, observability.NoopProviders())
 	if err != nil {
 		t.Fatalf("NewClient() error = %v", err)
 	}
@@ -105,7 +107,7 @@ func TestRealRedisRetryExhaustionArchivesTask(t *testing.T) {
 	}}
 	handler, err := NewHandler(repository, logger, HandlerConfig{
 		DatabaseTimeout: time.Second, TaskTimeout: 2 * time.Second, BatchSize: 100,
-	})
+	}, observability.NoopProviders())
 	if err != nil {
 		t.Fatalf("NewHandler() error = %v", err)
 	}

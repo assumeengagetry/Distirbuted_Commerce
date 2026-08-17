@@ -29,6 +29,7 @@ import (
 	store "github.com/assumeengagetry/distributed-commerce/internal/database/sqlc"
 	identityv1 "github.com/assumeengagetry/distributed-commerce/internal/genproto/identity/v1"
 	"github.com/assumeengagetry/distributed-commerce/internal/identity"
+	"github.com/assumeengagetry/distributed-commerce/internal/observability"
 	commerce "github.com/assumeengagetry/distributed-commerce/internal/order"
 	"github.com/assumeengagetry/distributed-commerce/internal/payment"
 	grpctransport "github.com/assumeengagetry/distributed-commerce/internal/transport/grpc"
@@ -46,7 +47,7 @@ func TestPaymentAPIIntegration(t *testing.T) {
 		MaxConnLifetime: time.Hour, MaxConnLifetimeJitter: 5 * time.Minute,
 		MaxConnIdleTime: 30 * time.Minute, HealthCheckPeriod: time.Minute, PingTimeout: 3 * time.Second,
 		OperationTimeout: 5 * time.Second, LockTimeout: 2 * time.Second, CommitResolutionTimeout: 2 * time.Second,
-	})
+	}, observability.NoopProviders())
 	if err != nil {
 		t.Fatalf("database.Open() error = %v", err)
 	}

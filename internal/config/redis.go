@@ -51,6 +51,7 @@ type JobWorkerConfig struct {
 	Concurrency             int
 	ShutdownTimeout         time.Duration
 	SessionCleanupBatchSize int32
+	Telemetry               TelemetryConfig
 }
 
 type JobAdminConfig struct {
@@ -176,12 +177,16 @@ func loadJobWorker(lookup lookupEnv) (JobWorkerConfig, error) {
 	if err != nil {
 		return JobWorkerConfig{}, err
 	}
+	telemetryConfig, err := loadTelemetryConfig(lookup, environment, "job-worker")
+	if err != nil {
+		return JobWorkerConfig{}, err
+	}
 	return JobWorkerConfig{
 		Environment: environment, ServiceName: serviceName, Database: databaseConfig,
 		Log: LogConfig{Level: logLevel}, Redis: redisConfig, Queue: queue,
 		TaskTimeout: taskTimeout, CleanupInterval: cleanupInterval,
 		Concurrency: int(concurrency), ShutdownTimeout: shutdownTimeout,
-		SessionCleanupBatchSize: batchSize,
+		SessionCleanupBatchSize: batchSize, Telemetry: telemetryConfig,
 	}, nil
 }
 

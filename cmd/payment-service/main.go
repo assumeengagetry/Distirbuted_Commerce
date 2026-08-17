@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -16,6 +17,8 @@ import (
 	"github.com/assumeengagetry/distributed-commerce/internal/observability"
 	"github.com/assumeengagetry/distributed-commerce/internal/payment"
 	"github.com/assumeengagetry/distributed-commerce/internal/platform/httpserver"
+	"github.com/assumeengagetry/distributed-commerce/internal/platform/metricsserver"
+	"github.com/assumeengagetry/distributed-commerce/internal/platform/process"
 	httptransport "github.com/assumeengagetry/distributed-commerce/internal/transport/http"
 )
 
@@ -27,7 +30,7 @@ func main() {
 	}
 }
 
-func run() error {
+func run() (result error) {
 	cfg, err := config.LoadForService("payment-service", "127.0.0.1:8083")
 	if err != nil {
 		return err
@@ -38,7 +41,17 @@ func run() error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	pool, err := database.Open(ctx, cfg.Database)
+	telemetryRuntime, err := observability.NewRuntime(ctx, cfg.Telemetry, cfg.ServiceName, cfg.Environment)
+	if err != nil {
+		return fmt.Errorf("create telemetry runtime: %w", err)
+	}
+	defer func() {
+		if err := telemetryRuntime.ShutdownWithin(cfg.Telemetry.ShutdownTimeout); err != nil {
+			result = errors.Join(result, fmt.Errorf("shutdown telemetry: %w", err))
+		}
+	}()
+	telemetry := telemetryRuntime.Providers()
+	pool, err := database.Open(ctx, cfg.Database, telemetry)
 	if err != nil {
 		return fmt.Errorf("open database: %w", err)
 	}
@@ -58,7 +71,8 @@ func run() error {
 		Target: cfg.GRPC.IdentityTarget, Timeout: cfg.GRPC.CallTimeout,
 		TLSCertFile: cfg.GRPC.TLSCertFile, TLSKeyFile: cfg.GRPC.TLSKeyFile,
 		TLSCAFile: cfg.GRPC.TLSCAFile, TLSServerName: cfg.GRPC.TLSServerName,
-		Logger: logger,
+		Logger:    logger,
+		Telemetry: telemetry,
 	})
 	if err != nil {
 		return fmt.Errorf("create identity gRPC client: %w", err)
@@ -85,10 +99,19 @@ func run() error {
 			Burst:             cfg.Payment.RateLimit.Burst, EntryTTL: cfg.Payment.RateLimit.EntryTTL,
 			MaxEntries: cfg.Payment.RateLimit.MaxEntries,
 		},
-		Now: time.Now,
+		Now:       time.Now,
+		Telemetry: telemetry,
 	})
 	if err != nil {
 		return fmt.Errorf("create payment HTTP router: %w", err)
 	}
-	return httpserver.Serve(ctx, cfg.HTTP, logger, router, stop)
+	return process.Run(
+		ctx,
+		func(ctx context.Context) error {
+			return httpserver.Serve(ctx, cfg.HTTP, logger, router, stop)
+		},
+		func(ctx context.Context) error {
+			return metricsserver.Serve(ctx, cfg.Telemetry.Metrics, logger, telemetryRuntime.MetricsHandler(), nil)
+		},
+	)
 }

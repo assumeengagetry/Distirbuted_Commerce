@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/redis/go-redis/extra/redisotel/v9"
 	"github.com/redis/go-redis/v9"
 
 	"github.com/assumeengagetry/distributed-commerce/internal/config"
+	"github.com/assumeengagetry/distributed-commerce/internal/observability"
 )
 
 func New(cfg config.RedisConfig) (*redis.Client, error) {
@@ -30,6 +32,45 @@ func New(cfg config.RedisConfig) (*redis.Client, error) {
 		PoolTimeout: cfg.PoolTimeout, PoolSize: cfg.PoolSize, MaxRetries: -1,
 		ContextTimeoutEnabled: true, TLSConfig: tlsConfig,
 	}), nil
+}
+
+func Instrument(
+	client redis.UniversalClient,
+	telemetry observability.Providers,
+	poolName string,
+	traceCommands bool,
+) error {
+	if client == nil {
+		return fmt.Errorf("Redis client is required for instrumentation")
+	}
+	if !telemetry.Enabled() {
+		return nil
+	}
+	if poolName != "cache" && poolName != "queue" {
+		return fmt.Errorf("Redis telemetry pool name must be cache or queue")
+	}
+	if err := redisotel.InstrumentMetrics(
+		client,
+		redisotel.WithMeterProvider(telemetry.MeterProvider),
+		redisotel.WithPoolName(poolName),
+		redisotel.WithSemConvCompliantMetrics(true),
+	); err != nil {
+		return fmt.Errorf("instrument Redis metrics: %w", err)
+	}
+	if !traceCommands {
+		return nil
+	}
+	if err := redisotel.InstrumentTracing(
+		client,
+		redisotel.WithTracerProvider(telemetry.TracerProvider),
+		redisotel.WithPoolName(poolName),
+		redisotel.WithDBStatement(false),
+		redisotel.WithCallerEnabled(false),
+		redisotel.WithDialFilter(false),
+	); err != nil {
+		return fmt.Errorf("instrument Redis tracing: %w", err)
+	}
+	return nil
 }
 
 func clientTLSConfig(cfg config.RedisConfig) (*tls.Config, error) {
