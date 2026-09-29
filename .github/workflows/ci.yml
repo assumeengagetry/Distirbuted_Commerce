@@ -59,7 +59,7 @@ jobs:
     timeout-minutes: 30
     services:
       postgres:
-        image: public.ecr.aws/docker/library/postgres:17-alpine@sha256:af194ccf3e2d7fe367012c7b88ce8b816c5c889b18a5b316799a1f0d7eac746a
+        image: docker.io/library/postgres:17-alpine@sha256:af194ccf3e2d7fe367012c7b88ce8b816c5c889b18a5b316799a1f0d7eac746a
         env:
           POSTGRES_DB: commerce
           POSTGRES_USER: commerce
@@ -72,7 +72,7 @@ jobs:
           --health-timeout 3s
           --health-retries 20
       redis:
-        image: public.ecr.aws/docker/library/redis:7.4-alpine@sha256:9702d01c1f10c3ea9f48211b4362e44f154ff02d063e6f7268eba804059f53bf
+        image: docker.io/library/redis:7.4-alpine@sha256:9702d01c1f10c3ea9f48211b4362e44f154ff02d063e6f7268eba804059f53bf
         ports:
           - 6379:6379
         options: >-
