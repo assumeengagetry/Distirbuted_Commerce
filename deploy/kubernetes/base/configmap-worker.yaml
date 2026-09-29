@@ -10,7 +10,7 @@ data:
   METRICS_ADDR: 127.0.0.1:9104
   QUEUE_REDIS_ADDR: redis-queue.example.invalid:6380
   QUEUE_REDIS_USERNAME: commerce
-  QUEUE_REDIS_DB: "0"
+  QUEUE_REDIS_DB: "1"
   QUEUE_REDIS_TLS_CA_FILE: /var/run/secrets/redis/ca.crt
   QUEUE_REDIS_TLS_SERVER_NAME: redis-queue.example.invalid
   JOB_QUEUE: maintenance

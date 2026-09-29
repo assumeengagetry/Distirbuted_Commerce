@@ -11,6 +11,7 @@ WORKER_BINARY := bin/job-worker
 JOB_ADMIN_BINARY := bin/job-admin
 MIGRATOR_BINARY := bin/migrator
 PROBE_BINARY := bin/loopback-probe
+RELEASE_VERIFY_BINARY := bin/release-verify
 MIGRATE_VERSION := v4.18.3
 MIGRATE_BIN := $(CURDIR)/bin/migrate-$(MIGRATE_VERSION)
 MIGRATE_PACKAGE := github.com/golang-migrate/migrate/v4/cmd/migrate@$(MIGRATE_VERSION)
@@ -42,6 +43,7 @@ IMAGE_SERVICES := user-service order-service payment-service job-worker job-admi
 IMAGE_PREFIX ?= localhost/distributed-commerce
 IMAGE_VERSION ?= dev
 IMAGE_REVISION ?= $(shell git rev-parse --short=12 HEAD 2>/dev/null || printf 'unknown')
+RELEASE_IMAGE_REGISTRY ?= ghcr.io/assumeengagetry/distributed-commerce
 PODMAN_BUILD_FLAGS ?=
 SECRETS_DIR := $(CURDIR)/.secrets
 QUADLET_FILES := \
@@ -50,7 +52,7 @@ QUADLET_FILES := \
 	deploy/quadlet/commerce-postgres.container \
 	deploy/quadlet/commerce-redis.container
 
-.PHONY: help init build benchmark openapi-check kube-check workflow-check image images run run-user run-order run-payment run-worker jobs-failed jobs-retry jobs-delete fmt fmt-check vet test test-race test-integration check release-check migrate-install \
+.PHONY: help init build benchmark openapi-check kube-check policy-check workflow-check release-manifest-check image images run run-user run-order run-payment run-worker jobs-failed jobs-retry jobs-delete fmt fmt-check vet test test-race test-integration check release-check migrate-install \
 	sqlc sqlc-vet secrets quadlet-check quadlet-install infra-up infra-down infra-status infra-logs \
 	migrate-up migrate-down migrate-version migrate-create require-env require-database-secret require-redis-secret require-user-secrets require-infra-secrets \
 	proto-tools proto-format proto-lint proto-generate proto-check mod-check vulncheck test-database
@@ -62,7 +64,9 @@ help:
 		'benchmark         Run informational Go benchmarks; optional BENCHTIME/COUNT' \
 		'openapi-check     Validate the OpenAPI 3.1 contract' \
 		'kube-check        Render base and production Kustomize manifests' \
+		'policy-check      Render the external Kyverno admission policy' \
 		'workflow-check    Lint GitHub Actions workflows' \
+		'release-manifest-check  Reject mutable/unapproved images; pass FILE=<rendered.yaml>' \
 		'image             Build one OCI image; pass SERVICE=<name>' \
 		'images            Build every production OCI image' \
 		'run               Run user-service with values from .env' \
@@ -105,6 +109,7 @@ build:
 	$(GO) build -trimpath -o $(JOB_ADMIN_BINARY) ./cmd/job-admin
 	$(GO) build -trimpath -o $(MIGRATOR_BINARY) ./cmd/migrator
 	$(GO) build -trimpath -o $(PROBE_BINARY) ./cmd/loopback-probe
+	$(GO) build -trimpath -o $(RELEASE_VERIFY_BINARY) ./cmd/release-verify
 
 benchmark:
 	$(GO) test -run '^$$' -bench . -benchmem -benchtime=$${BENCHTIME:-1s} -count=$${COUNT:-5} ./...
@@ -119,8 +124,15 @@ kube-check: $(KUSTOMIZE_BIN) $(KUBECONFORM_BIN)
 		$(KUBECONFORM_BIN) -strict -summary "$$base" "$$production"; \
 		! grep -Eq '^kind:[[:space:]]+Secret$$' "$$production" || { printf 'Rendered manifests must not contain Secret resources.\n' >&2; exit 1; }
 
+policy-check: $(KUSTOMIZE_BIN)
+	$(KUSTOMIZE_BIN) build security/policies/kyverno >/dev/null
+
 workflow-check: $(ACTIONLINT_BIN)
 	$(ACTIONLINT_BIN) .github/workflows/*.yml
+
+release-manifest-check:
+	@test -f '$(FILE)' || { printf 'FILE must point to a rendered Kubernetes manifest.\n' >&2; exit 2; }
+	RELEASE_IMAGE_REGISTRY='$(RELEASE_IMAGE_REGISTRY)' $(GO) run ./cmd/release-verify '$(FILE)'
 
 image:
 	@case '$(SERVICE)' in user-service|order-service|payment-service|job-worker|job-admin|migrator) ;; \
@@ -245,7 +257,7 @@ test-integration: require-env require-database-secret require-redis-secret $(MIG
 	$(MIGRATE_BIN) -path=db/migrations -database "$$TEST_DATABASE_URL" up; \
 	TEST_DATABASE_URL="$$TEST_DATABASE_URL" $(GO) test -count=1 -p=1 -tags=integration ./...
 
-check: proto-check openapi-check kube-check workflow-check fmt-check vet test test-race build sqlc-vet quadlet-check
+check: proto-check openapi-check kube-check policy-check workflow-check fmt-check vet test test-race build sqlc-vet quadlet-check
 
 release-check:
 	@$(MAKE) --no-print-directory check

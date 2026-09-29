@@ -5,6 +5,8 @@
 
 /bin/
 /coverage/
+/artifacts/
+/out/
 coverage.out
 *.test
 
