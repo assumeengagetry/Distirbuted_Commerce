@@ -118,7 +118,7 @@ jobs:
             '{schema:1,service:$service,image:$image,digest:$digest,version:$version,source_sha:$source_sha,platform:$platform,containerfile_sha256:$containerfile_sha256,migrations_sha256:$migrations_sha256,sbom:"spdx-json",scan_severity_gate:["HIGH","CRITICAL"],signature:"cosign-keyless",provenance:"slsa-v1"}' \
             > "artifacts/${{ matrix.service }}-release.json"
       - name: Upload release evidence
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-${{ matrix.service }}-${{ github.ref_name }}
           path: artifacts
