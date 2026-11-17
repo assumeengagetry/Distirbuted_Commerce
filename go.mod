@@ -4,7 +4,7 @@ go 1.26.6
 
 require (
 	aidanwoods.dev/go-paseto v1.6.0
-	github.com/alicebob/miniredis/v2 v2.38.0
+	github.com/alicebob/miniredis/v2 v2.39.0
 	github.com/exaring/otelpgx v0.11.1
 	github.com/getkin/kin-openapi v0.147.0
 	github.com/gin-gonic/gin v1.12.0
@@ -27,7 +27,7 @@ require (
 	go.opentelemetry.io/proto/otlp v1.11.0
 	golang.org/x/crypto v0.57.0
 	golang.org/x/time v0.15.0
-	google.golang.org/grpc v1.83.2
+	google.golang.org/grpc v1.84.0
 	google.golang.org/protobuf v1.36.12
 	gopkg.in/yaml.v3 v3.0.1
 )
