@@ -4,7 +4,7 @@ go 1.26.6
 
 require (
 	aidanwoods.dev/go-paseto v1.6.0
-	github.com/alicebob/miniredis/v2 v2.38.0
+	github.com/alicebob/miniredis/v2 v2.39.0
 	github.com/exaring/otelpgx v0.11.1
 	github.com/getkin/kin-openapi v0.147.0
 	github.com/gin-gonic/gin v1.12.0
