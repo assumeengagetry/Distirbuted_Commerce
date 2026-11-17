@@ -47,7 +47,7 @@ jobs:
         run: make vulncheck
       - name: Upload quality artifacts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: quality-${{ github.sha }}
           path: artifacts
@@ -121,7 +121,7 @@ jobs:
           docker logs "$REDIS_CONTAINER" > artifacts/redis.log 2>&1 || true
       - name: Upload integration artifacts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: integration-${{ github.sha }}
           path: artifacts
@@ -154,7 +154,7 @@ jobs:
           docker save "distributed-commerce/${{ matrix.service }}:${GITHUB_SHA}" | gzip -n > "artifacts/${{ matrix.service }}.tar.gz"
           sha256sum "artifacts/${{ matrix.service }}.tar.gz" > "artifacts/${{ matrix.service }}.sha256"
       - name: Upload image artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: image-${{ matrix.service }}-${{ github.sha }}
           path: artifacts
@@ -181,7 +181,7 @@ jobs:
           uname -a > artifacts/runner.txt
           go version >> artifacts/runner.txt
       - name: Upload benchmark artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: benchmarks-${{ github.sha }}
           path: artifacts
