@@ -30,7 +30,7 @@ dependencies must exist and be operated separately.
 Local infrastructure uses rootless Podman Quadlet and systemd user services.
 It is separate from the production Kubernetes model.
 
-Prerequisites are Go 1.26.6 or newer, Podman with Quadlet support, a working
+Prerequisites are Go 1.26.11 or newer, Podman with Quadlet support, a working
 systemd user session, PostgreSQL client tools, and OpenSSL. Initialize local
 configuration and owner-only secrets once, then start PostgreSQL and Redis:
 

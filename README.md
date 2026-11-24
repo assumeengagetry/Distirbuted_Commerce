@@ -155,7 +155,7 @@ Gin and gRPC remain transport adapters around typed boundaries. The three API pr
 
 | Area | Technology |
 | --- | --- |
-| Language | Go 1.26.6 |
+| Language | Go 1.26.11 |
 | HTTP | Gin 1.12 |
 | RPC | gRPC-Go 1.83 |
 | Contracts | Protocol Buffers 3, Buf 1.72 |
@@ -545,7 +545,7 @@ Users have `customer` or `admin` roles. Self-registration always creates a `cust
 
 ### Prerequisites
 
-- Go 1.26.6 or newer
+- Go 1.26.11 or newer
 - Podman 5.7 or newer with Quadlet support
 - PostgreSQL client tools (`psql`, `createdb`, and `dropdb`)
 - OpenSSL
