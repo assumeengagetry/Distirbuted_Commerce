@@ -1,4 +1,4 @@
-ARG GO_IMAGE=docker.io/library/golang:1.26.6-alpine3.24@sha256:3889b425f035be855a72fb4755265311293b6d414521f0a519d819df32222d83
+ARG GO_IMAGE=docker.io/library/golang:1.26.11-alpine3.24@sha256:ecb67f987aa1a57794c91d19ade7ae0209f2f0f5496aaef9e6ae85ddf92d02ab
 FROM ${GO_IMAGE} AS build
 
 ARG SERVICE
